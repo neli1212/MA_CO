@@ -1,0 +1,7 @@
+pyproject.toml
+src/maco_package/__init__.py
+src/maco_package/plot.py
+src/maco_package.egg-info/PKG-INFO
+src/maco_package.egg-info/SOURCES.txt
+src/maco_package.egg-info/dependency_links.txt
+src/maco_package.egg-info/top_level.txt
