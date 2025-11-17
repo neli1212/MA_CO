@@ -12,7 +12,16 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import umap
 import matplotlib.pyplot as plt
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import jensenshannon
+from scipy.stats import wasserstein_distance
+
+
 def evaluate_top1(model, dataloader, device):
+    """
+    Compute Top-1 accuracy over the given dataloader.
+    """
     model.eval()
     correct = 0
     total = 0
@@ -30,11 +39,16 @@ def evaluate_top1(model, dataloader, device):
 
     return correct / total
 
+
 def measure_latency(model, dataloader, device, warmup=20, runs=200):
+    """
+    Measure average inference latency in milliseconds.
+    Warmup iterations are skipped from measurement.
+    """
     model.eval()
     times = []
 
-
+    # Warmup runs
     with torch.no_grad():
         for i, (x, _) in enumerate(dataloader):
             if i >= warmup:
@@ -42,7 +56,7 @@ def measure_latency(model, dataloader, device, warmup=20, runs=200):
             x = x.to(device)
             _ = model(x)
 
-  
+    # Timed runs
     with torch.no_grad():
         for i, (x, _) in enumerate(tqdm(dataloader, total=runs, desc="Measuring Latency", leave=False)):
             if i >= runs:
@@ -59,6 +73,9 @@ def measure_latency(model, dataloader, device, warmup=20, runs=200):
 
 
 def measure_throughput(model, dataloader, device, runs=200):
+    """
+    Measure model throughput (images per second).
+    """
     model.eval()
     count = 0
     start = time.time()
@@ -74,15 +91,16 @@ def measure_throughput(model, dataloader, device, runs=200):
     duration = time.time() - start
     return count / duration
 
+
 def file_size_mb(path):
+    """Return file size in megabytes."""
     return os.path.getsize(path) / (1024 * 1024)
-import numpy as np
-from skimage.metrics import structural_similarity as ssim
-from scipy.spatial.distance import jensenshannon
-from scipy.stats import wasserstein_distance
 
 
 def normalize(cam):
+    """
+    Normalize CAM to [0,1].
+    """
     cam = cam.astype(np.float32)
     cam = cam - cam.min()
     cam = cam / (cam.max() + 1e-8)
@@ -90,13 +108,26 @@ def normalize(cam):
 
 
 def binarize(cam, threshold=0.8):
+    """
+    Binarize heatmap using fixed threshold.
+    """
     return (cam >= threshold).astype(np.float32)
 
 
 def compare_cams_advanced(cam_a, cam_b):
     """
+    Compare two CAM heatmaps using several similarity metrics.
+
     cam_a, cam_b: 2D numpy arrays (H, W)
-    Rückgabe: dict mit allen Metriken
+
+    Returns:
+        dict containing:
+            ssim  – structural similarity
+            corr  – Pearson correlation
+            dice  – Dice similarity of binarized maps
+            iou   – IoU of binarized maps
+            emd   – Earth Mover's Distance (1D on flattened maps)
+            js    – Jensen–Shannon divergence
     """
     cam_a = normalize(cam_a)
     cam_b = normalize(cam_b)
@@ -104,7 +135,7 @@ def compare_cams_advanced(cam_a, cam_b):
     # SSIM --------------------------------------------------------
     ssim_score = ssim(cam_a, cam_b, data_range=1.0)
 
-    # Pearson-Korrelation -----------------------------------------
+    # Pearson correlation -----------------------------------------
     corr = np.corrcoef(cam_a.flatten(), cam_b.flatten())[0, 1]
 
     # Dice ---------------------------------------------------------
@@ -117,11 +148,10 @@ def compare_cams_advanced(cam_a, cam_b):
     union = A.sum() + B.sum() - intersection
     iou = intersection / (union + 1e-8)
 
-    # Earth Mover's Distance (1D version on flattened maps) --------
+    # Earth Mover's Distance --------------------------------------
     emd = wasserstein_distance(cam_a.flatten(), cam_b.flatten())
 
-    # Jensen–Shannon Divergence -----------------------------------
-    # Heatmaps als Wahrscheinlichkeitsverteilung
+    # Jensen–Shannon divergence -----------------------------------
     pa = cam_a.flatten() + 1e-12
     pb = cam_b.flatten() + 1e-12
     pa /= pa.sum()
@@ -138,51 +168,40 @@ def compare_cams_advanced(cam_a, cam_b):
     }
 
 
-
 def compare_shap(shap_a, shap_b, top_k=0.2):
     """
     Compare two SHAP explanations (superpixel importance maps).
 
     Inputs:
-        shap_a, shap_b: 2D numpy arrays (H, W) of SHAP values
-        top_k: percentage of most important regions to compare (0.2 = 20%)
+        shap_a, shap_b: 2D numpy arrays (H, W)
+        top_k: fraction of most important pixels to compare
 
     Returns:
         dict with:
-            spearman: rank correlation between importance rankings
-            sign_agreement: % of pixels with same sign (+/-)
-            topk_overlap: Jaccard overlap of top-k important pixels
+            spearman        – Spearman rank correlation
+            sign_agreement  – percentage of same sign (+/-)
+            topk_overlap    – Jaccard overlap of top-k pixels
     """
 
-    # Flatten superpixel maps (SHAP works over superpixels, not pixel structure)
     a = shap_a.flatten().astype(np.float32)
     b = shap_b.flatten().astype(np.float32)
 
-    # ------------------------------
-    # 1. Spearman Rank-Korrelation
-    # ------------------------------
+    # Spearman ----------------------------------------------------
     spearman, _ = spearmanr(a, b)
 
-    # ------------------------------
-    # 2. Vorzeichen-Übereinstimmung
-    # ------------------------------
+    # Sign agreement ----------------------------------------------
     sign_a = np.sign(a)
     sign_b = np.sign(b)
 
-    # ignore exact zeros
     mask_nonzero = (sign_a != 0) | (sign_b != 0)
     sign_agree = (sign_a[mask_nonzero] == sign_b[mask_nonzero]).mean()
 
-    # ------------------------------
-    # 3. Top-k Overlap (wichtigste Regionen)
-    # ------------------------------
+    # Top-k overlap ------------------------------------------------
     k = int(len(a) * top_k)
 
-    # indices sorted by absolute importance
     idx_a = np.argsort(-np.abs(a))[:k]
     idx_b = np.argsort(-np.abs(b))[:k]
 
-    # Jaccard Overlap
     set_a = set(idx_a.tolist())
     set_b = set(idx_b.tolist())
     intersection = len(set_a & set_b)
@@ -194,43 +213,32 @@ def compare_shap(shap_a, shap_b, top_k=0.2):
         "sign_agreement": float(sign_agree),
         "topk_overlap": float(topk_overlap)
     }
+
+
 def compare_lime(mask_a, mask_b):
     """
-    Compare two LIME masks (binary segmentation maps).
+    Compare two LIME masks (binary relevance maps).
 
-    mask_a, mask_b: 2D numpy arrays with 0/1
+    mask_a, mask_b: 2D arrays with values 0/1
 
     Returns:
         dict with:
-            iou            – intersection-over-union of relevant segments
-            precision      – % of predicted relevant segments that match base
-            recall         – % of base relevant segments recovered
-            agreement      – % of all pixels with same importance status
+            iou         – intersection-over-union
+            precision   – predicted relevant pixels that match the base mask
+            recall      – recovered relevant pixels from base mask
+            agreement   – pixel-wise agreement
     """
 
-    # Ensure binary masks (in case LIME returned segments > 1)
     A = (mask_a > 0).astype(np.uint8)
     B = (mask_b > 0).astype(np.uint8)
 
-    # ------------------------------
-    # 1. IoU (Intersection-over-Union)
-    # ------------------------------
     intersection = np.logical_and(A, B).sum()
     union = np.logical_or(A, B).sum()
     iou = intersection / (union + 1e-8)
 
-    # ------------------------------
-    # 2. Precision / Recall
-    # ------------------------------
-    # precision: B relevance matches A relevance
     precision = intersection / (B.sum() + 1e-8)
-
-    # recall: A relevance recovered by B
     recall = intersection / (A.sum() + 1e-8)
 
-    # ------------------------------
-    # 3. Agreement
-    # ------------------------------
     agreement = (A == B).mean()
 
     return {
@@ -242,6 +250,10 @@ def compare_lime(mask_a, mask_b):
 
 
 def run_umap_visualization(feats_fp32, feats_qat, feats_ptq, labels_fp32):
+    """
+    Compute and plot UMAP embedding to compare feature spaces
+    of FP32, QAT INT8, and PTQ INT8 models.
+    """
     reducer = umap.UMAP(n_neighbors=30, min_dist=0.1, metric="cosine")
 
     all_feats = np.concatenate([feats_fp32, feats_qat, feats_ptq], axis=0)
@@ -254,7 +266,6 @@ def run_umap_visualization(feats_fp32, feats_qat, feats_ptq, labels_fp32):
     emb_qat  = embedding[n_fp32:n_fp32+n_qat]
     emb_ptq  = embedding[n_fp32+n_qat:]
 
-    # Plot
     plt.figure(figsize=(10, 7))
     plt.scatter(emb_fp32[:,0], emb_fp32[:,1], s=5, alpha=0.6, label="FP32")
     plt.scatter(emb_qat[:,0],  emb_qat[:,1],  s=5, alpha=0.6, label="QAT INT8")
@@ -266,6 +277,10 @@ def run_umap_visualization(feats_fp32, feats_qat, feats_ptq, labels_fp32):
 
 
 def extract_features2(model, dataloader, device="cpu"):
+    """
+    Extract final feature vectors from a model by hooking into its avgpool layer.
+    For quantized models, input to avgpool is manually dequantized.
+    """
     model.to(device).eval()
     feats = []
     labels = []
@@ -274,35 +289,29 @@ def extract_features2(model, dataloader, device="cpu"):
 
     def hook_fn(module, input, output):
         """
-        Wir ignorieren 'output' (QUInt8-Problem) und
-        berechnen unser eigenes avgpool-Ergebnis aus 'input[0]'.
+        Ignore 'output' (QUInt8 issue) and manually compute avgpool
+        using the float version of input[0].
         """
-        x = input[0]  # Tensor vor avgpool, Shape: (B, C, H, W)
+        x = input[0]  # (B, C, H, W) before avgpool
 
-        # Falls quantisiert: dequantisieren über int_repr/scale/zero_point
         if x.is_quantized:
-            int_repr = x.int_repr().float()      # (B, C, H, W) auf CPU
+            int_repr = x.int_repr().float()
             scale = x.q_scale()
             zero_point = x.q_zero_point()
-            x = (int_repr - zero_point) * scale  # float32 auf CPU
+            x = (int_repr - zero_point) * scale
         else:
             x = x.detach().float().cpu()
 
-        # Jetzt selbst avgpool auf float ausführen → (B, C, 1, 1)
         avg = F.adaptive_avg_pool2d(x, (1, 1))
-
-        # (B, C, 1, 1) → (B, C)
         activation["feat"] = avg.reshape(avg.size(0), -1).numpy()
 
-    # Hook: immer auf avgpool (bei FP32 und quantisierten Modellen vorhanden)
     handle = model.avgpool.register_forward_hook(hook_fn)
 
     with torch.no_grad():
         for x, y in tqdm(dataloader, desc="Extracting", leave=False):
             x = x.to(device)
-            _ = model(x)  # Hook füllt activation["feat"]
-
-            batch_feats = activation["feat"]          # (B, C)
+            _ = model(x)
+            batch_feats = activation["feat"]
             feats.append(batch_feats)
             labels.append(y.numpy())
 
