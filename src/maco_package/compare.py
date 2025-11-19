@@ -16,6 +16,7 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 from scipy.spatial.distance import jensenshannon
 from scipy.stats import wasserstein_distance
+import torch.nn.functional as F
 
 
 def evaluate_top1(model, dataloader, device):
@@ -320,3 +321,49 @@ def extract_features2(model, dataloader, device="cpu"):
     feats = np.concatenate(feats, axis=0)
     labels = np.concatenate(labels, axis=0)
     return feats, labels
+
+
+def compute_class_shifts(feats_fp32, feats_qat, feats_ptq, labels):
+    """
+    For each class:
+      - compute the mean L2 distance between FP32 and QAT features
+      - compute the mean L2 distance between FP32 and PTQ features
+      - compute centroid L2 distances as well 
+
+    Returns a dict: {class_id: {...metrics...}}
+    """
+    classes = np.unique(labels)
+    results = {}
+
+    # global check
+    assert feats_fp32.shape == feats_qat.shape == feats_ptq.shape
+    assert len(labels) == feats_fp32.shape[0]
+
+    for c in classes:
+        idx = (labels == c)
+
+        f32_c = feats_fp32[idx]
+        qat_c = feats_qat[idx]
+        ptq_c = feats_ptq[idx]
+
+        # 1) sample-wise mean L2 distance to FP32
+        d_qat_samples = np.linalg.norm(f32_c - qat_c, axis=1).mean()
+        d_ptq_samples = np.linalg.norm(f32_c - ptq_c, axis=1).mean()
+
+        # 2) centroid distances 
+        mu_f32 = f32_c.mean(axis=0)
+        mu_qat = qat_c.mean(axis=0)
+        mu_ptq = ptq_c.mean(axis=0)
+
+        d_qat_centroid = np.linalg.norm(mu_f32 - mu_qat)
+        d_ptq_centroid = np.linalg.norm(mu_f32 - mu_ptq)
+
+        results[int(c)] = {
+            "mean_L2_FP32_vs_QAT": float(d_qat_samples),
+            "mean_L2_FP32_vs_PTQ": float(d_ptq_samples),
+            "centroid_L2_FP32_vs_QAT": float(d_qat_centroid),
+            "centroid_L2_FP32_vs_PTQ": float(d_ptq_centroid),
+            "num_samples": int(idx.sum()),
+        }
+
+    return results
