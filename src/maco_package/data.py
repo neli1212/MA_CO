@@ -1,8 +1,6 @@
 # =====================================================================
 # Imports
 # =====================================================================
-
-
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -15,15 +13,19 @@ from tqdm import tqdm
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 
+# =====================================================================
+# Dataset & Class Mapping 
+# =====================================================================
+
 def collect_classes(train_dirs):
     """
-    Scan all training shard directories and collect all class names.
+    Collects all unique class names from training shards.
 
     Args:
-        train_dirs (list[Path]): List of training shard directories.
+        train_dirs (list[Path]): Training shard directories.
 
     Returns:
-        list[str]: Sorted list of class names (e.g. ['n01440764', ...]).
+        list[str]: Sorted class names.
     """
     classes = set()
     for d in train_dirs:
@@ -35,10 +37,10 @@ def collect_classes(train_dirs):
 
 def build_class_mapping(classes):
     """
-    Create a mapping from class name → integer index.
+    Builds a class-to-index mapping.
 
     Args:
-        classes (list[str]): List of class folder names.
+        classes (list[str]): Class names.
 
     Returns:
         dict: {class_name: index}
@@ -48,10 +50,10 @@ def build_class_mapping(classes):
 
 def build_transform():
     """
-    Standard ImageNet preprocessing transform.
+    Returns standard ImageNet preprocessing transform.
 
     Returns:
-        torchvision.transforms.Compose
+        transforms.Compose: Transform pipeline.
     """
     return transforms.Compose([
         transforms.Resize(256),
@@ -66,15 +68,12 @@ def build_transform():
 
 class RemappedDataset(Dataset):
     """
-    Wraps an ImageFolder dataset and remaps labels to a custom class_to_idx.
-
-    This is needed because each shard (train.X1/train.X2/...) has its own
-    ImageFolder-generated label mapping, but we want a unified mapping.
+    Remaps ImageFolder labels to a global index.
     """
     def __init__(self, imgfolder, class_to_idx):
         self.ds = imgfolder
         self.class_to_idx = class_to_idx
-        self.old_classes = imgfolder.classes  # the original class names
+        self.old_classes = imgfolder.classes
 
     def __getitem__(self, idx):
         img, old_label = self.ds[idx]
@@ -88,22 +87,13 @@ class RemappedDataset(Dataset):
 
 def build_datasets(root):
     """
-    Build unified train + validation datasets from ImageNet-100 folder layout:
-
-        root/
-           train.X1/
-           train.X2/
-           train.X3/
-           train.X4/
-           val.X/
+    Builds training and validation datasets.
 
     Args:
-        root (str or Path): Dataset root folder.
+        root (str | Path): Dataset root directory.
 
     Returns:
-        train_dataset: Concat of all training shards.
-        val_dataset: Validation set.
-        class_to_idx: Unified mapping for all classes.
+        tuple: (train_dataset, val_dataset, class_to_idx)
     """
     root = Path(root)
 
@@ -123,39 +113,41 @@ def build_datasets(root):
         train_parts.append(RemappedDataset(raw, class_to_idx))
 
     train_dataset = ConcatDataset(train_parts)
-    val_dataset   = RemappedDataset(ImageFolder(val_dir, transform=tf),
-                                    class_to_idx)
+    val_dataset = RemappedDataset(
+        ImageFolder(val_dir, transform=tf),
+        class_to_idx
+    )
 
     return train_dataset, val_dataset, class_to_idx
 
 
 def build_loaders(root, batch_size=64):
     """
-    Build train + val dataloaders.
+    Builds training and validation dataloaders.
 
     Args:
         root (str): Dataset root.
-        batch_size (int): Loader batch size.
+        batch_size (int): Batch size.
 
     Returns:
-        train_loader, val_loader, class_to_idx
+        tuple: (train_loader, val_loader, class_to_idx)
     """
     train_ds, val_ds, class_to_idx = build_datasets(root)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-    val_loader   = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
     return train_loader, val_loader, class_to_idx
 
 
 def get_calibration_batch(loader, num_batches=1):
     """
-    Collect a calibration batch (for PTQ).
+    Collects calibration samples for PTQ.
 
     Args:
-        loader: dataloader
-        num_batches: number of batches to extract
+        loader: DataLoader source.
+        num_batches (int): Number of batches.
 
     Returns:
-        torch.Tensor: Concatenated tensor of images.
+        torch.Tensor: Calibration images.
     """
     imgs = []
     for i, (batch_imgs, _) in enumerate(loader):
@@ -166,8 +158,9 @@ def get_calibration_batch(loader, num_batches=1):
 
 
 # =====================================================================
-# Fine-tuning Utility
+# Fine-tuning 
 # =====================================================================
+
 def finetuneModel(
     model,
     train_dataset,
@@ -179,118 +172,99 @@ def finetuneModel(
     full_finetune=False
 ):
     """
-    Fine-tune a pretrained model on a new dataset.
-
-    Automatically replaces classifier head depending on architecture:
-        - model.fc for ResNet
-        - model.classifier[-1] for MobileNet/EfficientNet
+    Fine-tunes a model on a new classification task.
 
     Args:
-        model: pretrained model
-        train_dataset: training dataset
-        val_dataset: validation dataset
-        num_classes: output classes
-        batch_size: dataloader batch size
-        epochs: number of fine-tuning epochs
-        lr: learning rate
-        full_finetune: if True, unfreeze all layers
+        model: Pretrained model.
+        train_dataset: Training dataset.
+        val_dataset: Validation dataset.
+        num_classes (int): Output classes.
+        batch_size (int): Batch size.
+        epochs (int): Training epochs.
+        lr (float): Learning rate.
+        full_finetune (bool): Train full model if True.
 
     Returns:
-        torch.nn.Module (model on CPU)
+        nn.Module: Fine-tuned model (CPU).
     """
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # -------------------------------------------------------
-    # Replace final head
-    # -------------------------------------------------------
     if hasattr(model, "fc") and isinstance(model.fc, nn.Linear):
-        # ResNet
         in_features = model.fc.in_features
         model.fc = nn.Linear(in_features, num_classes)
 
-    elif hasattr(model, "classifier") and isinstance(model.classifier, nn.Sequential):
-        # MobileNet / EfficientNet
-        last = model.classifier[-1]
-        if isinstance(last, nn.Linear):
-            in_features = last.in_features
-            model.classifier[-1] = nn.Linear(in_features, num_classes)
-        else:
-            raise ValueError("Unsupported classifier layout.")
+    elif hasattr(model, "classifier"):
+        if isinstance(model.classifier, nn.Sequential):
+            last = model.classifier[-1]
+            if isinstance(last, nn.Linear):
+                in_features = last.in_features
+                model.classifier[-1] = nn.Linear(in_features, num_classes)
+        elif isinstance(model.classifier, nn.Linear):
+            in_features = model.classifier.in_features
+            model.classifier = nn.Linear(in_features, num_classes)
 
     elif hasattr(model, "model") and hasattr(model.model, "classifier"):
-        # VGG16 inside QuantizableVGG16 wrapper
-        last = model.model.classifier[-1]
-        if isinstance(last, nn.Linear):
-            in_features = last.in_features
-            model.model.classifier[-1] = nn.Linear(in_features, num_classes)
+        if isinstance(model.model.classifier, nn.Sequential):
+            last = model.model.classifier[-1]
+            if isinstance(last, nn.Linear):
+                in_features = last.in_features
+                model.model.classifier[-1] = nn.Linear(in_features, num_classes)
         else:
-            raise ValueError("Unsupported VGG classifier layout.")
-
+            in_features = model.model.classifier.in_features
+            model.model.classifier = nn.Linear(in_features, num_classes)
     else:
-        raise ValueError("Model has no recognized classifier head.")
+        raise ValueError("Model architecture head not recognized.")
 
-    # -------------------------------------------------------
-    # Freeze backbone / unfreeze everything
-    # -------------------------------------------------------
     if full_finetune:
         for p in model.parameters():
             p.requires_grad = True
     else:
         for p in model.parameters():
             p.requires_grad = False
-        # Unfreeze only the classifier head
+
         if hasattr(model, "fc"):
-            head = model.fc                           # ResNet
+            head = model.fc
         elif hasattr(model, "classifier"):
-            head = model.classifier                   # MobileNet/EfficientNet
+            head = model.classifier
         elif hasattr(model, "model") and hasattr(model.model, "classifier"):
-            head = model.model.classifier             # QuantizableVGG16 wrapper
-        else:
-            raise ValueError("Model has no accessible classifier head.")
+            head = model.model.classifier
 
         for p in head.parameters():
             p.requires_grad = True
 
-    # -------------------------------------------------------
-    # DataLoaders
-    # -------------------------------------------------------
-    train_loader = DataLoader(train_dataset, batch_size=batch_size,
-                              shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
 
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size,
-                              shuffle=False, num_workers=4, pin_memory=True)
-
-    # -------------------------------------------------------
-    # Loss + Optimizer
-    # -------------------------------------------------------
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr
     )
 
-    # -------------------------------------------------------
-    # Training / Eval loops
-    # -------------------------------------------------------
     def train_one_epoch(model, loader):
         model.train()
         total_loss = 0.0
         pbar = tqdm(loader, desc="Finetuning", leave=False)
-
         for imgs, labels in pbar:
-            imgs = imgs.to(device)
-            labels = labels.to(device)
-
+            imgs, labels = imgs.to(device), labels.to(device)
             optimizer.zero_grad()
-            out = model(imgs)
-            loss = criterion(out, labels)
+            loss = criterion(model(imgs), labels)
             loss.backward()
             optimizer.step()
-
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{total_loss/(pbar.n+1):.4f}")
-
         return total_loss / len(loader)
 
     def evaluate(model, loader):
@@ -298,23 +272,16 @@ def finetuneModel(
         correct, total = 0, 0
         with torch.no_grad():
             for imgs, labels in loader:
-                imgs = imgs.to(device)
-                labels = labels.to(device)
+                imgs, labels = imgs.to(device), labels.to(device)
                 preds = model(imgs).argmax(1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
         return correct / total
 
-    # -------------------------------------------------------
-    # Training Loop
-    # -------------------------------------------------------
     model = model.to(device)
-
     for epoch in range(epochs):
         loss = train_one_epoch(model, train_loader)
         acc = evaluate(model, val_loader)
         print(f"[Epoch {epoch+1}] loss={loss:.4f} acc={acc*100:.2f}%")
 
-    # Move back to CPU for saving or quantization
-    model.cpu()
-    return model
+    return model.cpu()

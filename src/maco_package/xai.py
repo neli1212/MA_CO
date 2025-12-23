@@ -1,7 +1,6 @@
 # =====================================================================
 # Imports
 # =====================================================================
-
 import copy
 import json
 from pathlib import Path
@@ -14,194 +13,267 @@ from torchvision.transforms.functional import to_pil_image
 import shap
 from shap.maskers import Image as ImageMasker
 from lime import lime_image
-from torchcam.methods import (
-    GradCAM,
-    GradCAMpp,
-    XGradCAM,
-    LayerCAM,
-)
+from torchcam.methods import GradCAM, GradCAMpp, XGradCAM, LayerCAM
 import numpy as np
 from PIL import Image
 import cv2
 import matplotlib.pyplot as plt
 from skimage.segmentation import mark_boundaries
 from .utils import PreprocessImagenet
+from torch.fx import GraphModule, Interpreter
+from maco_package.utils import load_model_generic
+import umap
+from sklearn.preprocessing import StandardScaler
 
 # =====================================================================
 # Constants
 # =====================================================================
+
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+# =====================================================================
+# 1. Robust Prediction Engine
+# =====================================================================
 
-def compute_shap(model, pil_img, max_evals=200, device="cpu",
-                 plot=True, return_values=True):
+def robust_predict_batch(model, np_imgs, device, model_dtype):
     """
-    Compute (and optionally plot) SHAP explanations.
-    
+    Converts a batch of images to tensors, casts to the model's precision,
+    runs a forward pass, and returns probability distributions.
+
+    Args:
+        model (nn.Module): PyTorch model to run inference on.
+        np_imgs (list of np.ndarray): List of images in HWC format (0-255, uint8).
+        device (str or torch.device): Device to run the model on ('cpu' or 'cuda').
+        model_dtype (torch.dtype): Data type of the model (e.g., torch.float32, torch.quint8).
+
     Returns:
-        SHAP values (H, W) for the predicted class if return_values=True.
+        np.ndarray: Array of shape (N, num_classes) with softmax probabilities.
     """
-    import shap, numpy as np, copy, torch
-    from shap.maskers import Image as ImageMasker
-    from PIL import Image
+    batch_tensors = []
 
-    # ---- prepare model ----
-    net = copy.deepcopy(model).eval().to(device)
+    for arr in np_imgs:
+        if arr.max() <= 1.0: arr = (arr * 255).astype(np.uint8)
+        arr_pil = Image.fromarray(arr.astype("uint8"))
+        t = PreprocessImagenet(arr_pil).to(device)
+        batch_tensors.append(t)
 
-    # ---- preprocess once ----
-    img_np = PreprocessImagenet(pil_img, return_numpy=True)      # HWC uint8
-    img_tensor = PreprocessImagenet(pil_img).to(device)          # (1,3,224,224)
+    x = torch.cat(batch_tensors, dim=0)
 
-    # ---- prediction wrapper for SHAP ----
-    def predict_np(np_imgs):
-        batch = []
-        for arr in np_imgs:
-            arr_pil = Image.fromarray(arr.astype("uint8"))
-            batch.append(PreprocessImagenet(arr_pil))
-        x = torch.cat(batch).to(device)
-        with torch.no_grad():
-            out = net(x)
-        return out.softmax(1).cpu().numpy()
+    if model_dtype not in [torch.quint8, torch.qint8]:
+        x = x.to(model_dtype)
 
-    # ---- build SHAP masker ----
-    mean_px = (np.array(IMAGENET_MEAN) * 255).astype(np.float32)
-    baseline = np.ones_like(img_np, dtype=np.float32) * mean_px
-    masker = ImageMasker(baseline, img_np.shape)
+    with torch.no_grad():
+        try:
+            out = model(x)
+        except (RuntimeError, NotImplementedError):
+            x_quant = torch.quantize_per_tensor(x.float(), 0.01, 114, torch.quint8)
+            out = model(x_quant)
 
-    # ---- SHAP Explainer ----
-    explainer = shap.Explainer(predict_np, masker)
+        if hasattr(out, "dequantize"):
+            out = out.dequantize()
+        probs = out.float().softmax(1).cpu().numpy()
+
+    return probs
+
+# =====================================================================
+# 2. SHAP Wrapper
+# =====================================================================
+
+def compute_shap(model, pil_img, max_evals=200, device="cpu", plot=True, return_values=False):
+    """
+    Compute SHAP explanations for a single PIL image with optional plotting.
+
+    Args:
+        model (nn.Module): Model to explain.
+        pil_img (PIL.Image.Image): Input image.
+        max_evals (int): Maximum number of SHAP evaluations.
+        device (str): Device to run on ('cpu' or 'cuda').
+        plot (bool): Whether to plot the SHAP explanation.
+        return_values (bool): Whether to return the raw SHAP values.
+
+    Returns:
+        np.ndarray or None: SHAP values for predicted class if return_values=True, else None.
+    """
+    device = torch.device(device)
+    model = model.to(device).eval()
+
+    try: model_dtype = next(model.parameters()).dtype
+    except: model_dtype = torch.quint8
+
+    img_raw_pil = pil_img.resize((224, 224))
+    img_np = np.array(img_raw_pil)
+
+    def predict_callback(np_imgs):
+        return robust_predict_batch(model, np_imgs, device, model_dtype)
+
+    masker = ImageMasker("inpaint_telea", img_np.shape)
+    explainer = shap.Explainer(predict_callback, masker)
     shap_values = explainer(img_np[None], max_evals=max_evals)
 
-    # ---- select predicted class ----
-    pred_cls = int(np.argmax(predict_np(img_np[None])))
-    vals = np.array(shap_values.values[0][..., pred_cls], dtype=np.float32)
+    preds = predict_callback(img_np[None])
+    pred_cls = int(np.argmax(preds))
+    shap_numpy = shap_values.values[0][..., pred_cls]
 
-    # ---- plot ----
     if plot:
-        shap.image_plot([vals], img_np)
+        plt.figure()
+        shap.image_plot([shap_numpy], img_np.astype("uint8"), show=False)
+        plt.gcf().suptitle(f"SHAP | {model.__class__.__name__}", fontsize=10, y=0.95)
+        plt.show()
 
-    # ---- return SHAP array ----
-    del net
-    if return_values:
-        return vals
+    if return_values: return shap_numpy
+    return None
 
-def compute_lime(
-    model,
-    pil_img,
-    top_labels=1,
-    num_samples=1000,
-    device="cpu",
-    plot=True,
-    return_mask=True
-):
+# =====================================================================
+# 3. LIME Wrapper
+# =====================================================================
+
+def compute_lime(model, pil_img, top_labels=1, num_samples=500, device="cpu", plot=True, return_mask=False):
     """
-    Compute (and optionally plot) a LIME explanation.
+    Compute LIME explanations for a single PIL image.
+
+    Args:
+        model (nn.Module): Model to explain.
+        pil_img (PIL.Image.Image): Input image.
+        top_labels (int): Number of top predicted labels to explain.
+        num_samples (int): Number of perturbed samples to generate.
+        device (str): Device to run on ('cpu' or 'cuda').
+        plot (bool): Whether to plot the LIME explanation.
+        return_mask (bool): Whether to return the binary mask.
 
     Returns:
-        mask (H, W) if return_mask=True
+        np.ndarray or None: LIME mask if return_mask=True, else None.
     """
-    import copy, torch, numpy as np
-    from lime import lime_image
-    from skimage.segmentation import mark_boundaries
-    import matplotlib.pyplot as plt
-    from PIL import Image
+    device = torch.device(device)
+    model = model.to(device).eval()
 
-    # ---- Clone model to ensure no unwanted mutation ----
-    net = copy.deepcopy(model).eval().to(device)
+    try: model_dtype = next(model.parameters()).dtype
+    except: model_dtype = torch.quint8
 
-    # ---- Preprocess image ----
-    img_np = PreprocessImagenet(pil_img, return_numpy=True)      # HWC uint8
-    img_tensor = PreprocessImagenet(pil_img).to(device)          # (1,3,224,224)
+    img_raw_pil = pil_img.resize((224, 224))
+    img_np = np.array(img_raw_pil)
 
-    # ---- prediction wrapper for LIME (expects numpy HWC) ----
-    def predict_np(np_imgs):
-        batch = []
-        for arr in np_imgs:
-            arr_pil = Image.fromarray(arr.astype("uint8"))
-            batch.append(PreprocessImagenet(arr_pil))             # normalized CHW
-        x = torch.cat(batch, dim=0).to(device)
+    def predict_callback(np_imgs):
+        return robust_predict_batch(model, np_imgs, device, model_dtype)
 
-        with torch.no_grad():
-            out = net(x)
-
-        return out.softmax(1).cpu().numpy()
-
-    # ---- Run LIME ----
     explainer = lime_image.LimeImageExplainer()
     explanation = explainer.explain_instance(
         img_np.astype(np.uint8),
-        predict_np,
+        predict_callback,
         top_labels=top_labels,
         hide_color=0,
         num_samples=num_samples,
     )
 
-    # ---- Extract LIME mask ----
     label = explanation.top_labels[0]
-    lime_img, mask = explanation.get_image_and_mask(
-        label,
-        positive_only=True,
-        hide_rest=False
-    )
+    lime_img, mask = explanation.get_image_and_mask(label, positive_only=True, hide_rest=False)
 
-    # ---- Plot ----
     if plot:
+        plt.figure()
         plt.imshow(mark_boundaries(lime_img, mask))
         plt.axis("off")
+        lbl = model.__class__.__name__
+        if "GraphModule" in lbl: lbl = "PTQ/Graph"
+        plt.title(f"LIME | {lbl} | {str(model_dtype).replace('torch.','')}", fontsize=10)
         plt.show()
 
-    del net
+    if return_mask: return mask
+    return None
 
-    # ---- Return LIME mask (optional) ----
-    if return_mask:
-        return mask
-
-
-def compute_gradcams(
-    model,
-    pil_img,
-    target_layer=None,
-    device="cpu",
-    plot=True,
-    return_maps=False
-):
+def get_model_precision(model):
     """
-    Compute multiple gradient-based CAM maps (GradCAM, GradCAM++, XGradCAM, LayerCAM).
+    Determine the model's dtype, with special handling for quantized layers.
 
     Args:
-        model: PyTorch model
-        pil_img: PIL image, path, or tensor
-        target_layer: layer to hook; default = last conv (ResNet-like)
-        device: "cpu" or "cuda"
-        plot: visualize overlays
-        return_maps: return dict of CAM maps
+        model (nn.Module): Model to check.
 
     Returns:
-        dict: {method_name: heatmap_tensor} if return_maps=True
+        torch.dtype: Model's data type (e.g., torch.float32, torch.quint8).
     """
+    for m in model.modules():
+        if hasattr(m, 'weight') and callable(m.weight): return torch.quint8
+    try: return next(model.parameters()).dtype
+    except StopIteration: return torch.quint8
 
-    # ---------------------------------------------------------
-    # Clone model
-    # ---------------------------------------------------------
+# =====================================================================
+# 4. Activation Extraction
+# =====================================================================
+
+def get_activations(model, x, target_layer_name):
+    """
+    Extract activations from a specific layer, handling GraphModule/PTQ and eager models.
+
+    Args:
+        model (nn.Module or GraphModule): Model to extract activations from.
+        x (torch.Tensor): Input tensor of shape (1,3,H,W).
+        target_layer_name (str): Layer name to extract.
+
+    Returns:
+        torch.Tensor: Activation tensor of shape (C,H,W) from target layer.
+    """
+    storage = {}
+    is_graph = isinstance(model, GraphModule)
+
+    def save_act(val):
+        if hasattr(val, "dequantize"): val = val.dequantize()
+        if isinstance(val, torch.Tensor) and len(val.shape) == 4:
+            storage["A"] = val.detach().cpu()
+
+    if is_graph:
+        class FXInterpreter(Interpreter):
+            def run_node(self, node):
+                res = super().run_node(node)
+                clean_target = target_layer_name.replace(".", "_")
+                if (node.name == clean_target) or \
+                   (target_layer_name in str(node.target)) or \
+                   (target_layer_name == "features" and "features" in node.name):
+                    save_act(res)
+                return res
+        FXInterpreter(model).run(x.float())
+    else:
+        def hook_fn(module, input, output): save_act(output)
+        target = None
+        for name, mod in model.named_modules():
+            if name == target_layer_name: target = mod; break
+        if not target:
+            try: target = model.get_submodule(target_layer_name)
+            except: pass
+        if not target: raise RuntimeError(f"Layer '{target_layer_name}' not found.")
+        handle = target.register_forward_hook(hook_fn)
+        try: model(x)
+        except RuntimeError as e:
+            if "quantized" in str(e):
+                x_quant = torch.quantize_per_tensor(x.float(), 0.01, 114, torch.quint8)
+                model(x_quant)
+            else: raise e
+        finally: handle.remove()
+
+    if "A" not in storage: raise RuntimeError(f"No activations found for {target_layer_name}")
+    return storage["A"].squeeze(0)
+
+# =====================================================================
+# 5. GradCAM Engines
+# =====================================================================
+
+def compute_gradcams(model, pil_img, target_layer=None, device="cpu", plot=True, return_maps=False):
+    """
+    Compute GradCAM, GradCAM++, XGradCAM, and LayerCAM maps.
+
+    Args:
+        model (nn.Module): Model to explain.
+        pil_img (PIL.Image.Image): Input image.
+        target_layer (nn.Module): Layer to hook. Defaults to last conv.
+        device (str): Device to run on ('cpu' or 'cuda').
+        plot (bool): Whether to plot the CAM maps.
+        return_maps (bool): Whether to return raw CAM maps.
+
+    Returns:
+        dict or None: Dictionary of CAM maps if return_maps=True, else None.
+    """
     net = copy.deepcopy(model).eval().to(device)
+    x = PreprocessImagenet(pil_img).to(device).clone().detach().requires_grad_(True)
+    if target_layer is None: target_layer = net.layer4[-1]
 
-    # ---------------------------------------------------------
-    # Preprocess image
-    # ---------------------------------------------------------
-    x = PreprocessImagenet(pil_img).to(device)  # (1,3,224,224)
-    x = x.clone().detach().requires_grad_(True)
-
-    # ---------------------------------------------------------
-    # Default layer selection for ResNet
-    # ---------------------------------------------------------
-    if target_layer is None:
-        # Works for most torchvision ResNets
-        target_layer = net.layer4[-1]
-
-    # ---------------------------------------------------------
-    # Initialize CAM methods
-    # ---------------------------------------------------------
     cams = {
         "gradcam":   GradCAM(net, target_layer),
         "gradcam++": GradCAMpp(net, target_layer),
@@ -209,396 +281,309 @@ def compute_gradcams(
         "layercam":  LayerCAM(net, target_layer),
     }
 
-    # ---------------------------------------------------------
-    # Run forward pass
-    # ---------------------------------------------------------
     torch.set_grad_enabled(True)
     logits = net(x)
     cls = int(logits.argmax())
 
-    # ---------------------------------------------------------
-    # Compute CAM maps
-    # ---------------------------------------------------------
     maps = {}
     cam_names = list(cams.keys())
-
     for i, (name, cam) in enumerate(cams.items()):
-        # retain_graph=True for all except last
         hmap = cam(cls, logits, retain_graph=(i < len(cam_names)-1))[0]
-
-        # resize to 224×224
-        hmap = F.interpolate(
-            hmap.unsqueeze(0),
-            size=(224, 224),
-            mode="bilinear",
-            align_corners=False
-        )[0]  # shape (1, H, W)
+        hmap = F.interpolate(hmap.unsqueeze(0), size=(224, 224), mode="bilinear", align_corners=False)[0]
         maps[name] = hmap[0].detach().cpu()
 
-    # ---------------------------------------------------------
-    # Plot image + overlays
-    # ---------------------------------------------------------
     if plot:
-        import numpy as np
-        from PIL import Image
-
-        # original image (HWC uint8) for overlay
         img_np = PreprocessImagenet(pil_img, return_numpy=True)
-
         fig, axs = plt.subplots(1, len(maps), figsize=(14, 4))
-
-        if len(maps) == 1:
-            axs = [axs]
-
+        if len(maps) == 1: axs = [axs]
         for ax, (name, cam_map) in zip(axs, maps.items()):
-            ax.imshow(img_np)                            # show original image
-            ax.imshow(cam_map, cmap="jet", alpha=0.45)   # overlay CAM
+            ax.imshow(img_np)
+            ax.imshow(cam_map, cmap="jet", alpha=0.45)
             ax.set_title(name)
             ax.axis("off")
-
         plt.tight_layout()
         plt.show()
 
     del net
+    if return_maps: return maps
 
-    # ---------------------------------------------------------
-    # Optional return of raw maps
-    # ---------------------------------------------------------
-    if return_maps:
-        return maps
+# =====================================================================
+# 6. EigenCAM
+# =====================================================================
 
+def compute_eigencam(model, img_input, target_layer_name, device="cpu", plot=True, return_map=False):
+    """
+    Compute EigenCAM heatmap for a single image.
 
-def compute_eigencam(
-    model,
-    img_input,
-    target_layer_name,
-    device="cpu",
-    plot=True,
-    return_map=False,
-):
-    # ---------------------------------------------
-    # 1. Accept: PIL image, file path, or Tensor
-    # ---------------------------------------------
+    Args:
+        model (nn.Module): Model to explain.
+        img_input (PIL.Image.Image or torch.Tensor or str): Input image.
+        target_layer_name (str): Layer name to extract features from.
+        device (str): Device to run on.
+        plot (bool): Whether to visualize overlay.
+        return_map (bool): Whether to return heatmap array.
+
+    Returns:
+        np.ndarray or PIL.Image.Image: Heatmap or overlay depending on return_map flag.
+    """
     if isinstance(img_input, torch.Tensor):
-        t = img_input.detach().cpu()
-        if t.dim() == 4:
-            t = t.squeeze(0)
+        t = img_input.detach().cpu().float()
+        if t.dim() == 4: t = t[0]
         pil_img = to_pil_image(t)
-
     elif isinstance(img_input, str):
         pil_img = Image.open(img_input).convert("RGB")
-
     else:
         pil_img = img_input.convert("RGB")
 
-    # ---------------------------------------------
-    # 2. Preprocess (exact same as your original)
-    # ---------------------------------------------
-    preprocess = transforms.Compose([
-        transforms.Resize(256),
-        transforms.CenterCrop(224),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225]
-        )
-    ])
-    x = preprocess(pil_img).unsqueeze(0)
-
-    # ---------------------------------------------
-    # 3. Run model on CPU (INT8 requirement)
-    # ---------------------------------------------
-    device = torch.device("cpu")
+    x = PreprocessImagenet(pil_img).to(device).float()
     model = model.to(device).eval()
-    x = x.to(device)
+    target_dtype = get_model_precision(model)
+    if target_dtype != torch.quint8: x = x.to(target_dtype)
 
-    # ---------------------------------------------
-    # 4. Find target layer (your original logic)
-    # ---------------------------------------------
-    def find_layer(m, name):
-        for n, module in m.named_modules():
-            if n == name:
-                return module
-        raise RuntimeError(f"Layer {name} not found.")
+    try: A = get_activations(model, x, target_layer_name)
+    except Exception as e:
+        print(f"EigenCAM Error ({target_layer_name}): {e}")
+        return None
 
-    target_layer = find_layer(model, target_layer_name)
-
-    # ---------------------------------------------
-    # 5. Hook activations (your original code)
-    # ---------------------------------------------
-    activations = {}
-
-    def hook_fn(m, i, o):
-        if hasattr(o, "dequantize"):
-            o = o.dequantize()
-        activations["value"] = o.detach().cpu()
-
-    handle = target_layer.register_forward_hook(hook_fn)
-
-    with torch.no_grad():
-        _ = model(x)
-
-    handle.remove()
-
-    # EXACT original behavior: crash with KeyError if missing
-    A = activations["value"].squeeze(0)
-
-    # ---------------------------------------------
-    # 6. EigenCAM (your exact math)
-    # ---------------------------------------------
+    A = A.detach().cpu().float()
     C, H, W = A.shape
+    F_flat = A.view(C, -1).numpy()
+    F_flat = F_flat - F_flat.mean(axis=1, keepdims=True)
 
-    F_flat = A.reshape(C, -1).numpy()
-    F_flat = F_flat - F_flat.mean()
+    try:
+        _, _, vh = np.linalg.svd(F_flat, full_matrices=False)
+        principal_component = vh[0].reshape(H, W)
+    except Exception as e:
+        print(f"SVD Failed: {e}")
+        return None
 
-    _, _, vh = np.linalg.svd(F_flat, full_matrices=False)
-    pc = vh[0].reshape(H, W)
+    if np.abs(np.min(principal_component)) > np.abs(np.max(principal_component)):
+        principal_component = -principal_component
 
-    if pc.mean() < 0:
-        pc = -pc
-
-    cam = (pc - pc.min()) / (pc.max() - pc.min() + 1e-8)
+    cam = (principal_component - principal_component.min()) / (principal_component.max() - principal_component.min() + 1e-8)
     cam_resized = cv2.resize(cam, (pil_img.width, pil_img.height))
 
-    heatmap = cv2.applyColorMap(
-        (cam_resized * 255).astype(np.uint8),
-        cv2.COLORMAP_JET
-    )
+    heatmap = cv2.applyColorMap((cam_resized * 255).astype(np.uint8), cv2.COLORMAP_JET)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
+    overlay = (0.5 * np.array(pil_img) + 0.5 * heatmap).astype(np.uint8)
 
-    overlay = (
-        0.5 * np.array(pil_img) +
-        0.5 * heatmap
-    ).astype(np.uint8)
-
-    # ---------------------------------------------
-    # 7. Plot
-    # ---------------------------------------------
     if plot:
+        lbl = model.__class__.__name__
+        if "GraphModule" in lbl: lbl = "Graph/PTQ"
         plt.imshow(overlay)
-        plt.title(f"EigenCAM — {target_layer_name}")
+        plt.title(f"EigenCAM | {target_layer_name}", fontsize=8)
         plt.axis("off")
-        plt.show()
 
-    # ---------------------------------------------
-    # 8. Return map if requested
-    # ---------------------------------------------
-    if return_map:
-        return cam_resized
+    if return_map: return cam_resized
+    return overlay
 
+# =====================================================================
+# 7. Score-CAM Engine
+# =====================================================================
 
-class CamTap(nn.Module):
-    def forward(self, x):
-        return x
+def score_cam(model, x, pil_img, target_layer_name, target_class=None, max_channels=32):
+    """
+    Compute Score-CAM heatmap for a single input image.
 
-def insert_cam_tap_fx(model: fx.GraphModule,
-                      tap_name="cam_tap",
-                      pool_name="avgpool") -> fx.GraphModule:
+    Args:
+        model (nn.Module): Model to explain.
+        x (torch.Tensor): Preprocessed input tensor (1,3,H,W).
+        pil_img (PIL.Image.Image): Original PIL image for overlay.
+        target_layer_name (str): Layer name to extract activations from.
+        target_class (int, optional): Class index for which to compute CAM. Defaults to predicted class.
+        max_channels (int): Maximum number of channels to use from activation map.
 
-    if hasattr(model, tap_name):
-        return model   # prevent double insertion
-
-    gm = model
-    gm.add_submodule(tap_name, CamTap())
-    graph = gm.graph
-
-    # find avgpool
-    avgpool_node = None
-    for node in graph.nodes:
-        if node.op == "call_module" and node.target == pool_name:
-            avgpool_node = node
-            break
-
-    if avgpool_node is None:
-        raise RuntimeError("avgpool node not found")
-
-    source = avgpool_node.args[0]
-
-    # insert tap before avgpool
-    with graph.inserting_before(avgpool_node):
-        tap_node = graph.call_module(tap_name, args=(source,))
-
-    avgpool_node.replace_input_with(source, tap_node)
-
-    graph.lint()
-    gm.recompile()
-    return gm
-
-
-
-
-def get_target_layer(model, target_layer_name):
-    # INT8 CAM-TAP
-    if target_layer_name == "cam_tap" and hasattr(model, "cam_tap"):
-        return model.cam_tap
-
-    # FP32
-    for name, m in model.named_modules():
-        if name == target_layer_name:
-            return m
-
-    raise RuntimeError(f"Layer '{target_layer_name}' not found.")
-
-
-
-
-def get_activations(model, x, target_layer_name):
-    layer = get_target_layer(model, target_layer_name)
-    acts = {}
-
-    def hook(m, i, o):
-        if hasattr(o, "dequantize"):
-            o = o.dequantize()
-        acts["A"] = o.detach().cpu()
-
-    h = layer.register_forward_hook(hook)
-    with torch.no_grad():
-        logits = model(x)
-    h.remove()
-
-    if "A" not in acts:
-        raise RuntimeError("Hook did not run")
-
-    return acts["A"].squeeze(0), logits
-# ======================================================================
-
-
-
-
-def score_cam(model, x, pil_img, target_layer_name, target_class=None, max_channels=256):
+    Returns:
+        tuple: (overlay_image (np.ndarray), heatmap (np.ndarray))
+    """
     model.eval()
     device = x.device
+    target_dtype = get_model_precision(model)
 
-    A, logits = get_activations(model, x, target_layer_name)
+    if target_dtype == torch.quint8:
+        x_in = x.float()
+    else:
+        x_in = x.to(target_dtype)
+
+    A = get_activations(model, x_in, target_layer_name)
+    A[A < (A.max() * 0.12)] = 0
     C, H, W = A.shape
-
-    if target_class is None:
-        target_class = logits.argmax(dim=1).item()
-
-    # select channels
-    flat = A.view(C, -1)
-    var = flat.var(dim=1)
     k = min(max_channels, C)
-    idx = torch.topk(var, k).indices
+    idx = torch.topk(A.view(C, -1).var(dim=1), k).indices
     A_sel = A[idx]
-    C_sel = A_sel.shape[0]
 
-    # normalize
-    A_min = A_sel.view(C_sel, -1).min(dim=1)[0].view(C_sel,1,1)
-    A_max = A_sel.view(C_sel, -1).max(dim=1)[0].view(C_sel,1,1)
-    A_norm = (A_sel - A_min) / (A_max - A_min + 1e-8)
-    A_norm = torch.clamp(A_norm, 0, 1)
+    A_norm = (A_sel - A_sel.min()) / (A_sel.max() - A_sel.min() + 1e-8)
+    masks = F.interpolate(A_norm.unsqueeze(1).to(device), size=x.shape[2:], mode="bilinear", align_corners=False)
 
-    # upsample
-    masks = F.interpolate(
-        A_norm.unsqueeze(1).to(device),
-        size=x.shape[2:], 
-        mode="bilinear",
-        align_corners=False
-    )
-
-    # score masks
     scores = []
     with torch.no_grad():
-        for i in range(C_sel):
+        if target_dtype == torch.quint8:
+            try: logits = model(x_in)
+            except: logits = model(torch.quantize_per_tensor(x_in, 0.01, 114, torch.quint8))
+        else:
+            logits = model(x_in)
+
+        if hasattr(logits, "dequantize"): logits = logits.dequantize()
+        if target_class is None: target_class = logits.argmax(dim=1).item()
+
+        for i in range(len(A_sel)):
             mk = masks[i]
-            if mk.std() < 1e-6:
-                scores.append(0.0)
-                continue
-            masked_x = (x.float() * mk.float()).to(device)
-            out = model(masked_x)
-            scores.append(out[0, target_class].item())
+            if target_dtype != torch.quint8:
+                masked_x = x_in * mk.to(target_dtype)
+                out = model(masked_x)
+            else:
+                masked_x_float = x_in.float() * mk.float()
+                try: out = model(masked_x_float)
+                except: out = model(torch.quantize_per_tensor(masked_x_float, 0.01, 114, torch.quint8))
+            if hasattr(out, "dequantize"): out = out.dequantize()
+            scores.append(torch.softmax(out.float(), dim=1)[0, target_class].item())
 
-    scores = torch.tensor(scores).clamp(min=0)
-    if scores.sum() == 0:
-        scores = torch.ones_like(scores)
-    alphas = scores / (scores.sum() + 1e-8)
-
-    cam = torch.sum(alphas[:,None,None] * A_sel, dim=0).numpy()
-    if cam.mean() < 0:
-        cam = -cam
-
-    # overlay
+    scores = torch.tensor(scores).to(device)
+    cam = torch.sum(scores[:, None, None] * A_sel.to(device).float(), dim=0).cpu().numpy()
+    cam = np.maximum(cam, 0)
     cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
     cam = cv2.resize(cam, (pil_img.width, pil_img.height))
-    cam = (cam * 255).astype(np.uint8)
-
-    heat = cv2.applyColorMap(cam, cv2.COLORMAP_JET)
-    heat = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
-    overlay = (0.5 * np.array(pil_img) + 0.5 * heat).astype(np.uint8)
+    heat = cv2.applyColorMap((cam * 255).astype(np.uint8), cv2.COLORMAP_JET)
+    overlay = (0.5 * np.array(pil_img) + 0.5 * cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)).astype(np.uint8)
 
     return overlay, heat
-def compute_scorecam(
-    model,
-    img_input,
-    target_layer_name="layer4.2",
-    target_class=None,
-    model_label=None,
-    max_channels=256,
-    device="cpu",
-    plot=True,
-    return_map=False,
-    return_overlay=False,
-):
-    """
-    Score-CAM wrapper using your PreprocessImagenet() and score_cam().
-    Returns clean CAM map if return_map=True.
-    """
 
-    # ------------------------------------------------------------
-    # 1. Convert input to PIL.Image
-    # ------------------------------------------------------------
+# =====================================================================
+# 8. Score-CAM Wrapper
+# =====================================================================
+
+def compute_scorecam(model, img_input, target_layer_name="layer4.2", target_class=None,
+                     model_label=None, max_channels=256, device="cpu", plot=True,
+                     return_map=False, return_overlay=False):
+    """
+    Wrapper for Score-CAM with input handling and plotting.
+
+    Args:
+        model (nn.Module): Model to explain.
+        img_input (PIL.Image.Image or torch.Tensor): Input image.
+        target_layer_name (str): Layer name to extract activations from.
+        target_class (int, optional): Class index for CAM. Defaults to predicted.
+        model_label (str, optional): Label for plot title.
+        max_channels (int): Maximum channels from activation maps.
+        device (str): Device ('cpu' or 'cuda').
+        plot (bool): Whether to plot overlay.
+        return_map (bool): Return grayscale CAM map if True.
+        return_overlay (bool): Return overlay image if True.
+
+    Returns:
+        np.ndarray or tuple or None: Depending on return_map and return_overlay flags.
+    """
     if isinstance(img_input, torch.Tensor):
-        t = img_input.detach().cpu()
-        if t.dim() == 4:
-            t = t[0]
+        t = img_input.detach().cpu().float()
+        if t.dim() == 4: t = t[0]
         pil_img = to_pil_image(t)
-    elif isinstance(img_input, str):
-        pil_img = Image.open(img_input).convert("RGB")
     else:
         pil_img = img_input.convert("RGB")
 
-    # ------------------------------------------------------------
-    # 2. Preprocess
-    # ------------------------------------------------------------
-    device = torch.device("cpu")
-    x = PreprocessImagenet(pil_img).to(device)
-
+    device = torch.device(device)
     net = model.to(device).eval()
+    x = PreprocessImagenet(pil_img).to(device).float()
 
-    # ------------------------------------------------------------
-    # 3. Score-CAM
-    # ------------------------------------------------------------
-    overlay, heat = score_cam(
-        net,
-        x,
-        pil_img,
-        target_layer_name=target_layer_name,
-        target_class=target_class,
-        max_channels=max_channels,
-    )
+    try:
+        overlay, heat = score_cam(net, x, pil_img, target_layer_name, target_class, max_channels)
+    except Exception as e:
+        print(f"Error computing Score-CAM for {model_label}: {e}")
+        return None
 
-    # Convert RGB heatmap → grayscale CAM [0,1]
     cam_map = cv2.cvtColor(heat, cv2.COLOR_RGB2GRAY).astype("float32") / 255.0
 
-    # ------------------------------------------------------------
-    # 4. Plot
-    # ------------------------------------------------------------
     if plot:
         title = model_label if model_label else net.__class__.__name__
         plt.imshow(overlay)
-        plt.title(f"Score-CAM | {title} | layer={target_layer_name}")
+        plt.title(f"{title}\n{target_layer_name}", fontsize=8)
         plt.axis("off")
-        plt.show()
 
-    # ------------------------------------------------------------
-    # 5. Return
-    # ------------------------------------------------------------
-    if return_map and return_overlay:
-        return cam_map, overlay
-    elif return_map:
-        return cam_map
-    elif return_overlay:
-        return overlay
-    else:
-        return None
+    if return_map and return_overlay: return cam_map, overlay
+    elif return_map: return cam_map
+    elif return_overlay: return overlay
+    else: return None
+
+# =====================================================================
+# 9. Feature Extraction and UMAP
+# =====================================================================
+
+def get_model_features(model, dataloader, device="cpu", max_samples=None):
+    """
+    Extract features from a model using its global pooling layer.
+
+    Args:
+        model (nn.Module): Model to extract features from.
+        dataloader (DataLoader): PyTorch dataloader for images.
+        device (str): Device ('cpu' or 'cuda').
+        max_samples (int, optional): Maximum number of samples to extract.
+
+    Returns:
+        tuple: (features (np.ndarray), labels (np.ndarray))
+    """
+    model.eval().to(device)
+    features = []
+    labels = []
+    total_extracted = 0
+
+    target_layer = None
+    if hasattr(model, 'avgpool'): target_layer = model.avgpool
+    elif hasattr(model, 'global_pool'): target_layer = model.global_pool
+    if target_layer is None:
+        for name, mod in model.named_modules():
+            if 'avgpool' in name or 'global_pool' in name:
+                target_layer = mod
+                break
+
+    storage = {}
+    def hook_fn(module, input, output):
+        val = output
+        if hasattr(val, "dequantize"): val = val.dequantize()
+        feat = val.detach().cpu().reshape(val.size(0), -1).float()
+        storage['feat'] = feat
+
+    handle = target_layer.register_forward_hook(hook_fn)
+    model_dtype = get_model_precision(model)
+
+    with torch.no_grad():
+        for imgs, lbls in dataloader:
+            if max_samples is not None and total_extracted >= max_samples: break
+
+            x = imgs.to(device)
+            if model_dtype != torch.quint8: x = x.to(model_dtype)
+            try: model(x)
+            except:
+                xq = torch.quantize_per_tensor(x.float(), 0.01, 114, torch.quint8)
+                model(xq)
+
+            features.append(storage['feat'])
+            labels.append(lbls.cpu())
+            total_extracted += imgs.size(0)
+
+    handle.remove()
+    final_features = torch.cat(features)
+    final_labels = torch.cat(labels)
+
+    if max_samples is not None:
+        final_features = final_features[:max_samples]
+        final_labels = final_labels[:max_samples]
+
+    return final_features.numpy(), final_labels.numpy()
+
+def compute_umap(features, labels, n_neighbors=15, min_dist=0.1, metric='cosine'):
+    """
+    Reduce high-dimensional features to 2D using UMAP.
+
+    Args:
+        features (np.ndarray): Feature matrix of shape (N, D).
+        labels (np.ndarray): Class labels.
+        n_neighbors (int): Number of neighbors for UMAP.
+        min_dist (float): Minimum distance between points in UMAP embedding.
+        metric (str): Distance metric for UMAP.
+
+    Returns:
+        np.ndarray: 2D UMAP embedding of shape (N,2).
+    """
+    scaled_features = StandardScaler().fit_transform(features)
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, metric=metric, random_state=42)
+    embedding = reducer.fit_transform(scaled_features)
+    return embedding

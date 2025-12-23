@@ -1,10 +1,10 @@
 # =====================================================================
 # Imports
 # =====================================================================
-
 import warnings
 import torch
 import torch.nn as nn
+import copy
 from torch.utils.data import DataLoader
 import torch.ao.quantization as tq
 from torch.ao.quantization import (
@@ -14,21 +14,27 @@ from torch.ao.quantization import (
     convert,
 )
 from tqdm import tqdm
+
 # =====================================================================
-# Constants
+# Constants for Normalization 
 # =====================================================================
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
 
+# =====================================================================
+# Quantization Functions
+# =====================================================================
+
 def QuantizePTQ(model, calibration_input=None):
     """
-    Post-Training Quantization (FX PTQ).
+    Applies Post-Training Quantization using FX Graph Mode.
 
     Args:
-        model: float32 PyTorch model
-        calibration_input: single input tensor for tracing/calibration
+        model: Float32 PyTorch model to be quantized.
+        calibration_input: A representative batch of data for tracing and 
+                           calculating observer statistics.
     Returns:
-        quantized_model: int8 FX-graph-mode quantized model (eval mode)
+        quantized_model: Int8 FX-graph-mode quantized model in eval mode.
     """
     torch.backends.quantized.engine = "fbgemm"
     qconfig = tq.get_default_qconfig("fbgemm")
@@ -41,20 +47,20 @@ def QuantizePTQ(model, calibration_input=None):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
 
+        # Prepare the graph for quantization
         prepared = quantize_fx.prepare_fx(
             model,
             {"": qconfig},
             calibration_input,
         )
 
-        # Calibration run
+        # Calibration pass to determine scale and zero-point
         prepared(calibration_input)
 
-        # Convert to int8
+        # Convert the observed graph to actual quantized operations
         quantized = quantize_fx.convert_fx(prepared).eval()
 
     return quantized
-
 
 
 def trainQAT(
@@ -67,34 +73,11 @@ def trainQAT(
     momentum=0.9,
     backend="fbgemm"
 ):
-    """
-    Quantization-Aware Training for an arbitrary model.
-    Always uses CUDA if available.
-
-    Args:
-        model_fp32: FP32 model that supports torch.ao.quantization (should have QuantStub/DequantStub and fuse_model)
-        train_dataset: training dataset
-        val_dataset: validation dataset
-        epochs: number of QAT epochs
-        batch_size: batch size
-        lr: learning rate
-        momentum: SGD momentum
-        backend: quantization backend ("fbgemm" for x86)
-        
-    Returns:
-        model_qat  - QAT-trained (fake-quant) model on CPU
-        model_int8 - final converted INT8 model (CPU only)
-    """
-
-    # ----------------------------
-    # Device & quantization engine
-    # ----------------------------
+    # 1. Setup Device 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.quantized.engine = backend
+    print(f"--- QAT Training Device: {device} ---")
 
-    # ----------------------------
-    # DataLoaders
-    # ----------------------------
+    # 2. Data Loaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=4, pin_memory=True
@@ -104,80 +87,77 @@ def trainQAT(
         num_workers=4, pin_memory=True
     )
 
-    # ----------------------------
-    # Fuse layers if the model supports it
-    # ----------------------------
+    # 3. Prepare Model
+    model_fp32 = copy.deepcopy(model_fp32).cpu()
+    model_fp32.eval()
+    
+    # Fuse Layers
     if hasattr(model_fp32, "fuse_model"):
-        model_fp32.eval()
-        model_fp32.fuse_model()
+        try: model_fp32.fuse_model(is_qat=True)
+        except: model_fp32.fuse_model()
 
-    # ----------------------------
-    # Prepare QAT
-    # ----------------------------
+    model_fp32.train()
+    
+    # 4. Apply Configuration 
     qconfig = get_default_qat_qconfig(backend)
     model_fp32.qconfig = qconfig
-    model_fp32.train()
-    # Inject fake-quant observers
+    
+    # Force skip connections to be quantized
+    for name, module in model_fp32.named_modules():
+        if "FloatFunctional" in str(type(module)):
+            module.qconfig = qconfig
+
+    # Insert Observers
     prepare_qat(model_fp32, inplace=True)
+    
+    # 5. Move to GPU
+    model_qat = model_fp32.to(device)
 
-    # Move to CUDA for QAT
-    model_fp32.to(device)
-
-    model_qat = model_fp32
-
-    # ----------------------------
-    # Training setup
-    # ----------------------------
+    # 6. Training Loop
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model_qat.parameters(), lr=lr, momentum=momentum)
 
-    def train_one_epoch(model, loader):
-        model.train()
+    for epoch in range(epochs):
+        model_qat.train()
         total_loss = 0.0
-        pbar = tqdm(loader, desc="Training", leave=False)
-
+        
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
         for images, labels in pbar:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            out = model(images)
+            out = model_qat(images)
             loss = criterion(out, labels)
             loss.backward()
             optimizer.step()
-
+            
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{total_loss/(pbar.n+1):.4f}"})
-
-        return total_loss / len(loader)
-
-    def evaluate(model, loader):
-        model.eval()
-        correct = 0
-        total = 0
+            
+        # Validation
+        model_qat.eval()
+        correct = 0; total = 0
         with torch.no_grad():
-            for images, labels in loader:
-                images = images.to(device)
-                labels = labels.to(device)
-                preds = model(images).argmax(1)
+            for images, labels in val_loader:
+
+                images = images.to(device, non_blocking=True)
+                labels = labels.to(device, non_blocking=True)
+                
+                preds = model_qat(images).argmax(1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
-        return correct / total
+        
+        print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {correct/total*100:.2f}%")
 
-    # ----------------------------
-    # QAT main loop
-    # ----------------------------
-    for epoch in range(epochs):
-        loss = train_one_epoch(model_qat, train_loader)
-        acc = evaluate(model_qat, val_loader)
-        print(f"[Epoch {epoch+1}/{epochs}] Loss={loss:.4f} | ValAcc={acc*100:.2f}%")
+    # 7. Convert (CPU Only)
+    model_qat.cpu().eval()
 
-    # ----------------------------
-    # Convert to INT8 (CPU-only)
-    # ----------------------------
-    model_qat.eval()
-    model_qat.cpu()
-
-    model_int8 = convert(model_qat, inplace=False).eval()
+    old_engine = torch.backends.quantized.engine
+    torch.backends.quantized.engine = backend
+    try:
+        model_int8 = convert(model_qat, inplace=False)
+    finally:
+        torch.backends.quantized.engine = old_engine
 
     return model_qat, model_int8
