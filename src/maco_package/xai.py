@@ -98,10 +98,21 @@ def compute_shap(model, pil_img, max_evals=200, device="cpu", plot=True, return_
     device = torch.device(device)
     model = model.to(device).eval()
 
-    try: model_dtype = next(model.parameters()).dtype
-    except: model_dtype = torch.quint8
+    try: 
+        model_dtype = next(model.parameters()).dtype
+    except: 
+        model_dtype = torch.quint8
 
-    img_raw_pil = pil_img.resize((224, 224))
+    if isinstance(pil_img, (torch.Tensor, torch.FloatTensor, torch.cuda.FloatTensor)):
+        t = pil_img.detach().cpu().float()
+        if t.dim() == 4: t = t[0]
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        t = (t * std + mean).clamp(0, 1)
+        img_raw_pil = transforms.ToPILImage()(t).convert("RGB").resize((224, 224))
+    else:
+        img_raw_pil = pil_img.convert("RGB").resize((224, 224))
+
     img_np = np.array(img_raw_pil)
 
     def predict_callback(np_imgs):
@@ -117,11 +128,15 @@ def compute_shap(model, pil_img, max_evals=200, device="cpu", plot=True, return_
 
     if plot:
         plt.figure()
-        shap.image_plot([shap_numpy], img_np.astype("uint8"), show=False)
-        plt.gcf().suptitle(f"SHAP | {model.__class__.__name__}", fontsize=10, y=0.95)
+        plt.imshow(img_np)
+        plt.imshow(shap_numpy, cmap='jet', alpha=0.5)
+        plt.axis('off')
+        plt.title(f"SHAP | {model.__class__.__name__}")
         plt.show()
 
-    if return_values: return shap_numpy
+    if return_values: 
+        return shap_numpy
+        
     return None
 
 # =====================================================================
@@ -134,7 +149,7 @@ def compute_lime(model, pil_img, top_labels=1, num_samples=500, device="cpu", pl
 
     Args:
         model (nn.Module): Model to explain.
-        pil_img (PIL.Image.Image): Input image.
+        pil_img (PIL.Image.Image or torch.Tensor): Input image.
         top_labels (int): Number of top predicted labels to explain.
         num_samples (int): Number of perturbed samples to generate.
         device (str): Device to run on ('cpu' or 'cuda').
@@ -146,38 +161,52 @@ def compute_lime(model, pil_img, top_labels=1, num_samples=500, device="cpu", pl
     """
     device = torch.device(device)
     model = model.to(device).eval()
+    try: 
+        model_dtype = next(model.parameters()).dtype
+    except: 
+        model_dtype = torch.quint8
+    if isinstance(pil_img, torch.Tensor):
+        t = pil_img.detach().cpu().float()
+        if t.dim() == 4: t = t[0]
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        t = (t * std + mean).clamp(0, 1)
+        img_raw_pil = transforms.ToPILImage()(t).convert("RGB").resize((224, 224))
+    else:
+        img_raw_pil = pil_img.convert("RGB").resize((224, 224))
 
-    try: model_dtype = next(model.parameters()).dtype
-    except: model_dtype = torch.quint8
-
-    img_raw_pil = pil_img.resize((224, 224))
     img_np = np.array(img_raw_pil)
-
     def predict_callback(np_imgs):
         return robust_predict_batch(model, np_imgs, device, model_dtype)
 
-    explainer = lime_image.LimeImageExplainer()
-    explanation = explainer.explain_instance(
-        img_np.astype(np.uint8),
-        predict_callback,
-        top_labels=top_labels,
-        hide_color=0,
-        num_samples=num_samples,
-    )
+    explainer = lime_image.LimeImageExplainer(random_state=42)
+    
+    try:
+        explanation = explainer.explain_instance(
+            img_np.astype(np.uint8),
+            predict_callback,
+            top_labels=top_labels,
+            hide_color=0,
+            num_samples=num_samples
+        )
 
-    label = explanation.top_labels[0]
-    lime_img, mask = explanation.get_image_and_mask(label, positive_only=True, hide_rest=False)
+        label = explanation.top_labels[0]
+        lime_img, mask = explanation.get_image_and_mask(label, positive_only=True, hide_rest=False)
 
-    if plot:
-        plt.figure()
-        plt.imshow(mark_boundaries(lime_img, mask))
-        plt.axis("off")
-        lbl = model.__class__.__name__
-        if "GraphModule" in lbl: lbl = "PTQ/Graph"
-        plt.title(f"LIME | {lbl} | {str(model_dtype).replace('torch.','')}", fontsize=10)
-        plt.show()
+        if plot:
+            plt.imshow(mark_boundaries(lime_img, mask))
+            plt.axis("off")
+            lbl = model.__class__.__name__
+            if "GraphModule" in lbl: lbl = "Graph"
+            plt.title(f"LIME | {lbl} | {str(model_dtype).replace('torch.','')}", fontsize=10)
 
-    if return_mask: return mask
+        if return_mask: 
+            return mask.astype(np.float32)
+
+    except Exception as e:
+        print(f"LIME Error: {e}")
+        return None
+
     return None
 
 def get_model_precision(model):
@@ -201,7 +230,7 @@ def get_model_precision(model):
 
 def get_activations(model, x, target_layer_name):
     """
-    Extract activations from a specific layer, handling GraphModule/PTQ and eager models.
+    Extract activations from a specific layer.
 
     Args:
         model (nn.Module or GraphModule): Model to extract activations from.
@@ -310,8 +339,8 @@ def compute_gradcams(model, pil_img, target_layer=None, device="cpu", plot=True,
 # =====================================================================
 # 6. EigenCAM
 # =====================================================================
-
-def compute_eigencam(model, img_input, target_layer_name, device="cpu", plot=True, return_map=False):
+def compute_eigencam(model, img_input, target_layer_name, device="cpu", plot=True, 
+                     return_map=False, model_label=None):
     """
     Compute EigenCAM heatmap for a single image.
 
@@ -322,25 +351,44 @@ def compute_eigencam(model, img_input, target_layer_name, device="cpu", plot=Tru
         device (str): Device to run on.
         plot (bool): Whether to visualize overlay.
         return_map (bool): Whether to return heatmap array.
+        model_label(str): For Plots
 
     Returns:
         np.ndarray or PIL.Image.Image: Heatmap or overlay depending on return_map flag.
     """
+
     if isinstance(img_input, torch.Tensor):
+        x = img_input.clone().detach().to(device).float()
+        
+        if x.dim() == 3: 
+            x = x.unsqueeze(0)
+        elif x.dim() == 5: 
+            x = x.squeeze(0)
+
         t = img_input.detach().cpu().float()
-        if t.dim() == 4: t = t[0]
+        if t.dim() == 4: 
+            t = t.squeeze(0)
+            
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        t = t * std + mean
+        t = t.clamp(0, 1)
         pil_img = to_pil_image(t)
+
     elif isinstance(img_input, str):
         pil_img = Image.open(img_input).convert("RGB")
+        x = PreprocessImagenet(pil_img).to(device).float()
     else:
         pil_img = img_input.convert("RGB")
+        x = PreprocessImagenet(pil_img).to(device).float()
 
-    x = PreprocessImagenet(pil_img).to(device).float()
     model = model.to(device).eval()
     target_dtype = get_model_precision(model)
-    if target_dtype != torch.quint8: x = x.to(target_dtype)
+    if target_dtype != torch.quint8: 
+        x = x.to(target_dtype)
 
-    try: A = get_activations(model, x, target_layer_name)
+    try: 
+        A = get_activations(model, x, target_layer_name)
     except Exception as e:
         print(f"EigenCAM Error ({target_layer_name}): {e}")
         return None
@@ -368,13 +416,16 @@ def compute_eigencam(model, img_input, target_layer_name, device="cpu", plot=Tru
     overlay = (0.5 * np.array(pil_img) + 0.5 * heatmap).astype(np.uint8)
 
     if plot:
-        lbl = model.__class__.__name__
-        if "GraphModule" in lbl: lbl = "Graph/PTQ"
+        title = model_label if model_label else model.__class__.__name__
+        if "GraphModule" in title: 
+            title = "Graph/PTQ"
+        
         plt.imshow(overlay)
-        plt.title(f"EigenCAM | {target_layer_name}", fontsize=8)
+        plt.title(f"EigenCAM | {title}\n{target_layer_name}", fontsize=8)
         plt.axis("off")
 
-    if return_map: return cam_resized
+    if return_map: 
+        return cam_resized
     return overlay
 
 # =====================================================================
@@ -411,10 +462,8 @@ def score_cam(model, x, pil_img, target_layer_name, target_class=None, max_chann
     k = min(max_channels, C)
     idx = torch.topk(A.view(C, -1).var(dim=1), k).indices
     A_sel = A[idx]
-
     A_norm = (A_sel - A_sel.min()) / (A_sel.max() - A_sel.min() + 1e-8)
     masks = F.interpolate(A_norm.unsqueeze(1).to(device), size=x.shape[2:], mode="bilinear", align_corners=False)
-
     scores = []
     with torch.no_grad():
         if target_dtype == torch.quint8:
@@ -456,52 +505,62 @@ def compute_scorecam(model, img_input, target_layer_name="layer4.2", target_clas
                      model_label=None, max_channels=256, device="cpu", plot=True,
                      return_map=False, return_overlay=False):
     """
-    Wrapper for Score-CAM with input handling and plotting.
-
-    Args:
-        model (nn.Module): Model to explain.
-        img_input (PIL.Image.Image or torch.Tensor): Input image.
-        target_layer_name (str): Layer name to extract activations from.
-        target_class (int, optional): Class index for CAM. Defaults to predicted.
-        model_label (str, optional): Label for plot title.
-        max_channels (int): Maximum channels from activation maps.
-        device (str): Device ('cpu' or 'cuda').
-        plot (bool): Whether to plot overlay.
-        return_map (bool): Return grayscale CAM map if True.
-        return_overlay (bool): Return overlay image if True.
-
-    Returns:
-        np.ndarray or tuple or None: Depending on return_map and return_overlay flags.
+    Wrapper für Score-CAM.
     """
+    device = torch.device(device)
+    model = model.to(device).eval()
+
+    # --- INPUT HANDLING (Kopie von EigenCAM Logik) ---
     if isinstance(img_input, torch.Tensor):
+        # 1. Tensor direkt für das Modell (bereits normalisiert vom Loader)
+        x = img_input.clone().detach().to(device).float()
+        if x.dim() == 3: x = x.unsqueeze(0)
+        elif x.dim() == 5: x = x.squeeze(0) # Failsafe für Video-Batches
+
+        # 2. PIL Image für den Plot erstellen (Denormalisieren für korrekte Farben)
         t = img_input.detach().cpu().float()
-        if t.dim() == 4: t = t[0]
+        if t.dim() == 4: t = t.squeeze(0)
+        
+        # ImageNet Denormalisierung für den Plot-Hintergrund
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        t = t * std + mean
+        t = t.clamp(0, 1)
         pil_img = to_pil_image(t)
     else:
+        # Standard PIL Handling (Normalisierung wird hier durchgeführt)
         pil_img = img_input.convert("RGB")
+        x = PreprocessImagenet(pil_img).to(device).float()
 
-    device = torch.device(device)
-    net = model.to(device).eval()
-    x = PreprocessImagenet(pil_img).to(device).float()
-
+    # --- BERECHNUNG ---
     try:
-        overlay, heat = score_cam(net, x, pil_img, target_layer_name, target_class, max_channels)
+        # Aufruf der Engine mit dem bereits korrekt vorbereiteten Tensor 'x'
+        overlay, heat = score_cam(model, x, pil_img, target_layer_name, target_class, max_channels)
     except Exception as e:
         print(f"Error computing Score-CAM for {model_label}: {e}")
         return None
 
+    # Heatmap in Graustufen (0.0 - 1.0) für Metriken (SSIM, Pearson etc.)
     cam_map = cv2.cvtColor(heat, cv2.COLOR_RGB2GRAY).astype("float32") / 255.0
 
+    # --- VISUALISIERUNG ---
     if plot:
-        title = model_label if model_label else net.__class__.__name__
+        title = model_label if model_label else model.__class__.__name__
+        if "GraphModule" in title: title = "Graph/PTQ"
+        
         plt.imshow(overlay)
-        plt.title(f"{title}\n{target_layer_name}", fontsize=8)
+        plt.title(f"Score-CAM | {title}\n{target_layer_name}", fontsize=8)
         plt.axis("off")
 
-    if return_map and return_overlay: return cam_map, overlay
-    elif return_map: return cam_map
-    elif return_overlay: return overlay
-    else: return None
+    # --- OUTPUT ---
+    if return_map and return_overlay: 
+        return cam_map, overlay
+    elif return_map: 
+        return cam_map
+    elif return_overlay: 
+        return overlay
+    else: 
+        return None
 
 # =====================================================================
 # 9. Feature Extraction and UMAP
@@ -509,65 +568,95 @@ def compute_scorecam(model, img_input, target_layer_name="layer4.2", target_clas
 
 def get_model_features(model, dataloader, device="cpu", max_samples=None):
     """
-    Extract features from a model using its global pooling layer.
-
-    Args:
-        model (nn.Module): Model to extract features from.
-        dataloader (DataLoader): PyTorch dataloader for images.
-        device (str): Device ('cpu' or 'cuda').
-        max_samples (int, optional): Maximum number of samples to extract.
-
-    Returns:
-        tuple: (features (np.ndarray), labels (np.ndarray))
+    Universal feature extractor that finds the last valid 4D or 2D layer 
+    before the classifier, handles quantization, and flattens output.
     """
     model.eval().to(device)
     features = []
     labels = []
     total_extracted = 0
+    storage = {}
 
+    # Find the target layer
     target_layer = None
-    if hasattr(model, 'avgpool'): target_layer = model.avgpool
-    elif hasattr(model, 'global_pool'): target_layer = model.global_pool
-    if target_layer is None:
-        for name, mod in model.named_modules():
-            if 'avgpool' in name or 'global_pool' in name:
-                target_layer = mod
+    
+    if hasattr(model, 'avgpool'):
+        target_layer = model.avgpool
+    
+    elif hasattr(model, 'layers'):
+        if type(model.layers) == torch.nn.modules.module.Module:
+            children = list(model.layers.children())
+            if children:
+                target_layer = children[-1]
+            else:
+                target_layer = model.layers
+        else:
+            target_layer = model.layers
+        
+    elif hasattr(model, 'features'):
+        # Für VGG/ResNet-Strukturen
+        target_layer = list(model.features.modules())[-1]
+    
+    else:
+        all_mods = [m for m in model.modules() if not isinstance(m, (nn.Sequential, nn.ModuleList))]
+        for m in reversed(all_mods):
+            if not isinstance(m, nn.Linear):
+                target_layer = m
                 break
 
-    storage = {}
     def hook_fn(module, input, output):
-        val = output
-        if hasattr(val, "dequantize"): val = val.dequantize()
+        val = output[0] if isinstance(output, (tuple, list)) else output
+        # Handle Quantized Tensors
+        if hasattr(val, "dequantize"): 
+            val = val.dequantize()
+        
+        # Global Average Pool if the output is still 4D 
+        if len(val.shape) == 4:
+            val = torch.mean(val, dim=[2, 3])
+            
+        # Flatten and move to CPU
         feat = val.detach().cpu().reshape(val.size(0), -1).float()
         storage['feat'] = feat
 
     handle = target_layer.register_forward_hook(hook_fn)
-    model_dtype = get_model_precision(model)
+    
+    # Precision Check
+    try:
+        model_dtype = next(model.parameters()).dtype
+    except StopIteration:
+        model_dtype = torch.quint8
 
     with torch.no_grad():
         for imgs, lbls in dataloader:
-            if max_samples is not None and total_extracted >= max_samples: break
+            if max_samples is not None and total_extracted >= max_samples:
+                break
 
             x = imgs.to(device)
-            if model_dtype != torch.quint8: x = x.to(model_dtype)
-            try: model(x)
-            except:
-                xq = torch.quantize_per_tensor(x.float(), 0.01, 114, torch.quint8)
-                model(xq)
+            # Handle float variants (fp32, fp16, bf16)
+            if model_dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                x = x.to(model_dtype)
+            
+            try:
+                model(x)
+            except Exception:
+                # Handle Quantized INT8 models requiring quint8 input
+                x_quant = torch.quantize_per_tensor(x.cpu().float(), 0.1, 0, torch.quint8).to(device)
+                model(x_quant)
 
             features.append(storage['feat'])
             labels.append(lbls.cpu())
             total_extracted += imgs.size(0)
 
     handle.remove()
-    final_features = torch.cat(features)
-    final_labels = torch.cat(labels)
+    
+    final_features = torch.cat(features).numpy()
+    final_labels = torch.cat(labels).numpy()
 
     if max_samples is not None:
         final_features = final_features[:max_samples]
         final_labels = final_labels[:max_samples]
 
-    return final_features.numpy(), final_labels.numpy()
+    return final_features, final_labels
 
 def compute_umap(features, labels, n_neighbors=15, min_dist=0.1, metric='cosine'):
     """

@@ -1,22 +1,18 @@
 # =====================================================================
 # Imports
 # =====================================================================
-import warnings
 import torch
 import torch.nn as nn
 import copy
+import gc
+import warnings
 from torch.utils.data import DataLoader
-import torch.ao.quantization as tq
-from torch.ao.quantization import (
-    quantize_fx,
-    get_default_qat_qconfig,
-    prepare_qat,
-    convert,
-)
 from tqdm import tqdm
+from torch.ao.quantization import get_default_qat_qconfig_mapping, get_default_qconfig_mapping
+from torch.ao.quantization.quantize_fx import prepare_fx, prepare_qat_fx, convert_fx
 
 # =====================================================================
-# Constants for Normalization 
+# Constants
 # =====================================================================
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -25,41 +21,60 @@ IMAGENET_STD  = [0.229, 0.224, 0.225]
 # Quantization Functions
 # =====================================================================
 
-def QuantizePTQ(model, calibration_input=None):
+def QuantizePTQ(model, calibration_loader=None, num_calib_batches=10):
     """
-    Applies Post-Training Quantization using FX Graph Mode.
+    Applies Post-Training Quantization (PTQ) using FX Graph Mode with calibration.
 
     Args:
-        model: Float32 PyTorch model to be quantized.
-        calibration_input: A representative batch of data for tracing and 
-                           calculating observer statistics.
+        model (nn.Module): The Float32 model to be quantized.
+        calibration_loader (DataLoader, optional): DataLoader providing real data for calibration.
+        num_calib_batches (int): Number of batches to use for calibration.
+
     Returns:
-        quantized_model: Int8 FX-graph-mode quantized model in eval mode.
+        nn.Module: The quantized Int8 model (FX Graph Module).
     """
-    torch.backends.quantized.engine = "fbgemm"
-    qconfig = tq.get_default_qconfig("fbgemm")
+    device = next(model.parameters()).device
+    model.eval()
 
-    if calibration_input is None:
-        calibration_input = torch.randn(1, 3, 224, 224)
+    # 1. Setup Configuration
+    qconfig_mapping = get_default_qconfig_mapping("fbgemm")
 
-    model = model.eval()
+    # 2. Determine Example Input (Safe Check)
+    if calibration_loader is not None and torch.is_tensor(calibration_loader):
+        # Case A: Input is a Tensor (Single Batch)
+        example_input = calibration_loader[0:1].to(device)
+    elif calibration_loader is not None:
+        # Case B: Input is a DataLoader
+        try:
+            example_input = next(iter(calibration_loader))[0][0:1].to(device)
+        except:
+             example_input = torch.randn(1, 3, 224, 224).to(device)
+    else:
+        # Case C: No input provided
+        example_input = torch.randn(1, 3, 224, 224).to(device)
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
+    # Prepare model
+    prepared = prepare_fx(model, qconfig_mapping, example_input)
 
-        # Prepare the graph for quantization
-        prepared = quantize_fx.prepare_fx(
-            model,
-            {"": qconfig},
-            calibration_input,
-        )
+    # 3. Calibration Pass
+    if calibration_loader is not None:
+        if torch.is_tensor(calibration_loader):
+            print("⚖️ Calibrating PTQ on provided Tensor batch...")
+            with torch.no_grad():
+                prepared(calibration_loader.to(device))
+        else:
+            print(f"⚖️ Calibrating PTQ on {num_calib_batches} batches...")
+            with torch.no_grad():
+                for i, (images, _) in enumerate(calibration_loader):
+                    if i >= num_calib_batches: break
+                    prepared(images.to(device))
+    else:
+        print("⚠️ WARNING: No loader provided. Calibrating on noise.")
+        prepared(example_input)
 
-        # Calibration pass to determine scale and zero-point
-        prepared(calibration_input)
-
-        # Convert the observed graph to actual quantized operations
-        quantized = quantize_fx.convert_fx(prepared).eval()
-
+    # 4. Convert to Int8
+    quantized = convert_fx(prepared)
+    
     return quantized
 
 
@@ -68,15 +83,39 @@ def trainQAT(
     train_dataset,
     val_dataset,
     epochs=5,
-    batch_size=64,
-    lr=1e-4,
+    batch_size=40,
+    lr=1e-5,
     momentum=0.9,
-    backend="fbgemm"
+    backend="fbgemm",
+    patience=None
 ):
-    # 1. Setup Device 
+    """
+    Executes Quantization Aware Training using FX Graph Mode.
+
+    Args:
+        model_fp32 (nn.Module): The pretrained Float32 model.
+        train_dataset (Dataset): Training data.
+        val_dataset (Dataset): Validation data.
+        epochs (int): Number of training epochs.
+        batch_size (int): Batch size (lower than standard training to save VRAM).
+        lr (float): Learning rate (should be low for QAT).
+        momentum (float): Optimizer momentum.
+        backend (str): Quantization backend ('fbgemm' or 'qnnpack').
+        patience (int, optional): Early stopping patience.
+
+    Returns:
+        tuple: (model_qat, model_int8, best_epoch)
+            - model_qat: The best QAT model (simulated quantization, on GPU).
+            - model_int8: The best converted Int8 model (CPU).
+            - best_epoch: The epoch number where best accuracy was achieved.
+    """
+    # 1. Resource Cleanup
+    torch.cuda.empty_cache()
+    gc.collect()
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"--- QAT Training Device: {device} ---")
-
+    
     # 2. Data Loaders
     train_loader = DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,
@@ -87,36 +126,42 @@ def trainQAT(
         num_workers=4, pin_memory=True
     )
 
-    # 3. Prepare Model
-    model_fp32 = copy.deepcopy(model_fp32).cpu()
-    model_fp32.eval()
-    
-    # Fuse Layers
-    if hasattr(model_fp32, "fuse_model"):
-        try: model_fp32.fuse_model(is_qat=True)
-        except: model_fp32.fuse_model()
+    # 3. Prepare Model for FX
+    try:
+        example_input = next(iter(train_loader))[0].to("cpu")
+    except StopIteration:
+        raise ValueError("Train dataset is empty!")
 
+    model_fp32 = copy.deepcopy(model_fp32).to("cpu")
     model_fp32.train()
-    
-    # 4. Apply Configuration 
-    qconfig = get_default_qat_qconfig(backend)
-    model_fp32.qconfig = qconfig
-    
-    # Force skip connections to be quantized
-    for name, module in model_fp32.named_modules():
-        if "FloatFunctional" in str(type(module)):
-            module.qconfig = qconfig
 
-    # Insert Observers
-    prepare_qat(model_fp32, inplace=True)
-    
-    # 5. Move to GPU
-    model_qat = model_fp32.to(device)
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend)
 
-    # 6. Training Loop
+    try:
+        model_qat = prepare_qat_fx(
+            model_fp32, 
+            qconfig_mapping, 
+            example_input
+        )
+    except Exception as e:
+        print(f"❌ FX Tracing Failed: {e}")
+        raise e
+
+    model_qat = model_qat.to(device)
+    model_qat.apply(torch.nn.intrinsic.qat.freeze_bn_stats)
+    model_qat.apply(torch.quantization.enable_observer)
+    model_qat.apply(torch.quantization.enable_fake_quant)
+    # 4. Training Loop
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model_qat.parameters(), lr=lr, momentum=momentum)
 
+    best_acc = 0.0
+    stagnant = 0
+    best_epoch = 0
+    best_qat_state = copy.deepcopy(model_qat.state_dict())
+
+    print(f"🚀 Starting QAT (Batch Size: {batch_size}, LR: {lr})...")
+    
     for epoch in range(epochs):
         model_qat.train()
         total_loss = 0.0
@@ -134,30 +179,50 @@ def trainQAT(
             
             total_loss += loss.item()
             pbar.set_postfix({"loss": f"{total_loss/(pbar.n+1):.4f}"})
-            
+
         # Validation
         model_qat.eval()
         correct = 0; total = 0
+        
         with torch.no_grad():
             for images, labels in val_loader:
-
                 images = images.to(device, non_blocking=True)
                 labels = labels.to(device, non_blocking=True)
-                
                 preds = model_qat(images).argmax(1)
                 correct += (preds == labels).sum().item()
                 total += labels.size(0)
         
-        print(f"Epoch {epoch+1} | Loss: {total_loss/len(train_loader):.4f} | Val Acc: {correct/total*100:.2f}%")
+        acc = correct / total
+        avg_loss = total_loss / len(train_loader)
+        
+        print(f"[Epoch {epoch+1}] loss={avg_loss:.4f} acc={acc*100:.2f}%")
 
-    # 7. Convert (CPU Only)
-    model_qat.cpu().eval()
+        # Save Best Model
+        if acc > best_acc:
+            best_acc = acc
+            best_epoch = epoch + 1
+            stagnant = 0
+            best_qat_state = copy.deepcopy(model_qat.state_dict())
+        else:
+            if patience is not None:
+                stagnant += 1
+                if stagnant >= patience:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
 
-    old_engine = torch.backends.quantized.engine
-    torch.backends.quantized.engine = backend
+    # 5. Conversion
+    print(f"🏆 Loading Best Model from Epoch {best_epoch} (Acc: {best_acc*100:.2f}%)")
+    
+    model_qat.cpu()
+    torch.cuda.empty_cache()
+    
+    model_qat.load_state_dict(best_qat_state)
+    model_qat.eval()
+    
     try:
-        model_int8 = convert(model_qat, inplace=False)
-    finally:
-        torch.backends.quantized.engine = old_engine
+        model_int8 = convert_fx(model_qat)
+    except Exception as e:
+        print(f"⚠️ Conversion Warning: {e}")
+        model_int8 = model_qat 
 
-    return model_qat, model_int8
+    return model_qat, model_int8, best_epoch

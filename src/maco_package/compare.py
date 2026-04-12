@@ -4,16 +4,23 @@
 import os
 import numpy as np
 import torch
+import torchvision.transforms as transforms
 from scipy.stats import spearmanr, wasserstein_distance
-from scipy.spatial.distance import jensenshannon
 from skimage.metrics import structural_similarity as ssim
 from maco_package.xai import (
-    compute_scorecam, compute_eigencam, compute_shap, compute_lime
+    compute_scorecam,
+    compute_eigencam,
+    compute_shap,
+    compute_lime,
+    compute_umap
 )
 from maco_package.utils import load_model_generic
 from tqdm import tqdm
+from scipy.spatial import procrustes
+from sklearn.manifold import trustworthiness
+
 # =====================================================================
-# 1. COMPREHENSIVE METRICS LIBRARY
+# 1. METRICS 
 # =====================================================================
 
 def normalize_map(cam):
@@ -28,305 +35,367 @@ def binarize_map(cam, threshold=0.3):
 def compare_heatmaps(map_a, map_b):
     """
     Used for: ScoreCAM, EigenCAM
-    Metrics: SSIM, Corr, Dice, IoU, EMD, JS-Div
+    Metrics: SSIM, Pearson Correlation, Wasserstein Distance (EMD), IoU
     """
-    # Resize B to match A
     if map_a.shape != map_b.shape:
         import cv2
         map_b = cv2.resize(map_b, (map_a.shape[1], map_a.shape[0]))
-
     a = normalize_map(map_a)
     b = normalize_map(map_b)
-    
+
     # Continuous Metrics
     score_ssim = ssim(a, b, data_range=1.0)
     score_corr = np.corrcoef(a.flatten(), b.flatten())[0, 1]
-    score_emd  = wasserstein_distance(a.flatten(), b.flatten())
-    
-    # JS Divergence (Treat as probability dist)
-    pa = a.flatten() + 1e-12; pa /= pa.sum()
-    pb = b.flatten() + 1e-12; pb /= pb.sum()
-    score_js = jensenshannon(pa, pb)
+    score_emd = wasserstein_distance(a.flatten(), b.flatten())
 
-    # Binary Metrics (Dice / IoU)
+    # Binary Metrics (IoU)
     bin_a = binarize_map(a)
     bin_b = binarize_map(b)
     intersection = (bin_a * bin_b).sum()
     union = (bin_a + bin_b).sum() - intersection
-    
-    score_dice = (2 * intersection) / (bin_a.sum() + bin_b.sum() + 1e-8)
-    score_iou  = intersection / (union + 1e-8)
+    score_iou = intersection / (union + 1e-8)
 
     return {
         "ssim": float(score_ssim),
         "corr": float(score_corr),
-        "emd":  float(score_emd),
-        "js":   float(score_js),
-        "dice": float(score_dice),
-        "iou":  float(score_iou)
+        "emd": float(score_emd),
+        "iou": float(score_iou)
     }
 
-def compare_attributions(attr_a, attr_b, top_k_percent=0.2):
-    """
-    Used for: SHAP
-    Metrics: Spearman, Sign Agreement, Top-K Overlap
-    """
+def compare_attributions_signed_rank(attr_a, attr_b, top_k_percent=0.2):
     a = attr_a.flatten()
     b = attr_b.flatten()
-
     # Spearman
     score_spearman, _ = spearmanr(a, b)
-    if np.isnan(score_spearman): score_spearman = 0.0
-
-    # Sign Agreement
-    sign_a = np.sign(a)
-    sign_b = np.sign(b)
-    # Compare only where values are non-zero to avoid noise
-    mask = (sign_a != 0) | (sign_b != 0)
-    if mask.sum() > 0:
-        score_sign = (sign_a[mask] == sign_b[mask]).mean()
-    else:
-        score_sign = 1.0
-
-    # Top-K Overlap
+    if np.isnan(score_spearman):
+        score_spearman = 0.0
+    # top k
     k = max(1, int(len(a) * top_k_percent))
-    idx_a = set(np.argsort(-np.abs(a))[:k])
-    idx_b = set(np.argsort(-np.abs(b))[:k])
-    score_overlap = len(idx_a & idx_b) / k
+    
+    idx_a = np.argsort(-np.abs(a))[:k]
+    idx_b = np.argsort(-np.abs(b))[:k]
+    
+    matches = 0
+    for i in range(k):
+        if idx_a[i] == idx_b[i]:
+            if np.sign(a[idx_a[i]]) == np.sign(b[idx_b[i]]):
+                matches += 1
+                
+    score_signed_rank = matches / k
 
     return {
         "spearman": float(score_spearman),
-        "sign_agreement": float(score_sign),
-        "topk_overlap": float(score_overlap)
+        "topk_overlap": float(score_signed_rank)
     }
 
 def compare_masks(mask_a, mask_b):
     """
     Used for: LIME
-    Metrics: IoU, Precision, Recall, Agreement
+    Metrics: IoU
     """
-    # LIME masks are usually segmentation indices, treat as binary overlap of the region
     a = (mask_a > 0).astype(np.uint8)
     b = (mask_b > 0).astype(np.uint8)
-
     intersection = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
-    
     iou = intersection / (union + 1e-8)
-    precision = intersection / (b.sum() + 1e-8) 
-    recall = intersection / (a.sum() + 1e-8)    
-    agreement = (a == b).mean()
-
     return {
-        "iou": float(iou),
-        "precision": float(precision),
-        "recall": float(recall),
-        "agreement": float(agreement)
+        "iou": float(iou)
     }
-import numpy as np
-from scipy.spatial.distance import euclidean
 
 def compare_umap_embeddings(emb_fp32, emb_var, labels):
     """
-    Compares the FP32 embedding to a variant (INT8/FP16) embedding.
-    Returns the average drift distance per class.
+    Used for: UMAO
+    Metrics: Procrustes disparity, Trustworthiness, Mean Centroid Displacement.
     """
-    classes = np.unique(labels)
+
+    # Procrustes 
+    mtx1, mtx2, disparity = procrustes(emb_fp32, emb_var)
+
+    # Trustworthiness 
+    t_score = trustworthiness(emb_fp32, emb_var, n_neighbors=15)
+
+    # Mean Centroid Displacement
+    unique_labels = np.unique(labels)
     drifts = []
-
-    # 1. Normalize embeddings 
-    e32 = (emb_fp32 - emb_fp32.min()) / (emb_fp32.max() - emb_fp32.min())
-    evar = (emb_var - emb_var.min()) / (emb_var.max() - emb_var.min())
-
-    for c in classes:
-        mask = (labels == c)
-        
-        if not np.any(mask): continue
-        
-        # Calculate the 'Center of Gravity' for this class in both maps
-        centroid_32 = e32[mask].mean(axis=0)
-        centroid_var = evar[mask].mean(axis=0)
-        
-        # Calculate Euclidean Distance between the two centers
-        drift = euclidean(centroid_32, centroid_var)
-        drifts.append(drift)
-
-    avg_drift = np.mean(drifts)
-
-    std_32 = np.std(e32)
-    std_var = np.std(evar)
-    density_change = std_var / std_32
+    for label in unique_labels:
+        mask = (labels == label)
+        if np.any(mask):
+            c32 = mtx1[mask].mean(axis=0)
+            cvar = mtx2[mask].mean(axis=0)
+            drifts.append(np.linalg.norm(c32 - cvar))
+    
+    mean_drift = float(np.mean(drifts)) if drifts else 0.0
 
     return {
-        "avg_logic_drift": float(avg_drift),
-        "density_ratio": float(density_change)
+        "procrustes_disparity": float(disparity),
+        "trustworthiness": float(t_score),
+        "centroid_drift": mean_drift
     }
+
+
 # =====================================================================
 # 2. COMPARATOR PIPELINE CLASS 
 # =====================================================================
+
 class XAIComparator:
     def __init__(self, base_path, num_classes=100):
         self.base_path = base_path
         self.num_classes = num_classes
-        self.results = {} 
+        self.results = {}          # stores aggregated sums and counts
 
     def load_model(self, arch, tag, suffix, device):
-        path = os.path.join(self.base_path, arch, f"{arch}_{suffix}.pth")
-        
-        if not os.path.exists(path):
-            path = os.path.join(self.base_path, arch, f"{arch}_ft1_{suffix}.pth")
-            
-        if not os.path.exists(path):
+        arch_dir = os.path.join(self.base_path, arch)
+        if not os.path.exists(arch_dir):
+            print(f" ⚠️ Directory missing: {arch_dir}")
             return None
-            
+        # Search for the file containing the suffix
+        all_files = os.listdir(arch_dir)
+        matches = [f for f in all_files if suffix in f and f.endswith(".pth")]
+        if not matches:
+            print(f" ⚠️ No file found for {arch} with suffix: {suffix}")
+            return None
+        # Use the first valid match
+        path = os.path.join(arch_dir, matches[0])
         try:
             from maco_package.utils import load_model_generic
             return load_model_generic(f"{arch}-{tag}", path, self.num_classes, device=device)
         except Exception as e:
-            print(f"      ⚠️ Load Failed {tag}: {e}")
+            print(f" ⚠️ Load Failed {tag}: {e}")
             return None
 
-    def run(self, arch, sample_images, methods, val_loader, epochs_ft=1, epochs_qat=3):
+    def run(self, arch, val_loader, num_images, methods, epochs_ft=1, epochs_qat=3, max_samples_umap=None):
         """
-        Main execution loop for XAI comparison.
-        Now includes Global Logic Drift via UMAP.
+        Main execution loop for XAI comparison – processes images in batches.
         """
-        from maco_package.xai import get_model_features, compute_umap
+        from maco_package.xai import get_model_features
         from sklearn.preprocessing import StandardScaler
         import umap
 
-        print(f"\n⚡ Processing Architecture: {arch.upper()}")
-        
-        # 1. Initialize results
-        self.results[arch] = {} 
+        print("\n" + "="*80)
+        print(f"[ARCH] {arch.upper()} – XAI comparison started")
+        print("="*80)
 
-        # 2. Load Baseline (The "Golden" Model)
-        baseline_suffix = f"ft{epochs_ft}_finetuned"
-        model_fp32 = self.load_model(arch, "fp32", baseline_suffix, "cuda")
-        
+        self.results[arch] = {}
+
+        # Load Baseline
+        model_fp32 = self.load_model(arch, "fp32", "fp32_polished", "cuda")
+        model_fp32_cpu = self.load_model(arch, "fp32", "fp32_polished", "cpu") if "eigencam" in methods else None
         if model_fp32 is None:
-            print(f"   ❌ Baseline {baseline_suffix} missing. Skipping {arch}.")
+            print(f" ❌ Baseline fp32_polished missing. Skipping {arch}.")
             return
+        print(" ✓ Baseline model loaded.")
 
-        # --- UMAP GLOBAL LOGIC DRIFT (FP32 BASELINE) ---
-        print("   Extracting Global Features for UMAP (FP32 Baseline)...")
-        # Extract features for UMAP (Max 1000 for speed)
-        feats_32, lbls_32 = get_model_features(model_fp32, val_loader, device="cuda", max_samples=None)
-        
-        # Fit the Baseline projection space
-        scaler = StandardScaler()
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.1, random_state=42)
-        
-        feats_32_scaled = scaler.fit_transform(feats_32)
-        emb_32 = reducer.fit_transform(feats_32_scaled)
-
-        # 3. Determine Layer Mapping for Baseline
+        # Determine Layer Mapping for Baseline and Variants
         layer_map = {
-            "resnet50": "layer4.2",
-            "vgg16": "model.features.28",
-            "mobilenet_v2": "features.18.0",
-            "efficientnet_b0": "features.8",
-            "densenet121": "features.norm5"
+            "resnet50": {
+                "fp32": "layer4.2.relu2", 
+                "fp16": "layer4.2.relu2", 
+                "bf16": "layer4.2.relu2",
+                "int8": "layer4.2.conv3", 
+                "ptqfx": "layer4.2.conv3"
+            },
+            "vgg16": {
+                "fp32": "features.29", 
+                "fp16": "features.29", 
+                "bf16": "features.29",
+                "int8": "features.28", 
+                "ptqfx": "features.28"
+            },
+            "mobilenet_v2": {
+                "fp32": "features.18.2", 
+                "fp16": "features.18.2", 
+                "bf16": "features.18.2",
+                "int8": "features.18.0", 
+                "ptqfx": "features.18.0"
+            },
+            "densenet121": {
+                "fp32": "features.denseblock4.denselayer16.conv2", 
+                "fp16": "features.denseblock4.denselayer16.conv2", 
+                "bf16": "features.denseblock4.denselayer16.conv2",
+                "int8": "features.norm5", 
+                "ptqfx": "features.norm5"
+            },
+            "googlenet": {
+                "fp32": "inception5b.branch4.1.relu", 
+                "fp16": "inception5b.branch4.1.relu", 
+                "bf16": "inception5b.branch4.1.relu",
+                "int8": "inception5b.branch4.1.conv", 
+                "ptqfx": "inception5b.branch4.1.conv"
+            },
+            "mnasnet": {
+                "fp32": "layers.16", 
+                "fp16": "layers.16", 
+                "bf16": "layers.16",
+                "int8": "layers.14", 
+                "ptqfx": "layers.14"
+            }
         }
-        layer_fp32 = layer_map.get(arch, "features")
+        layer_fp32 = layer_map.get(arch, {}).get("fp32", "features")
 
-        # 4. Generate Baseline Maps for per-image methods
-        baselines = {m: [] for m in methods}
-        print("   Generating Baseline Explanations (FP32)...")
-        
-        for img in tqdm(sample_images, desc="Baselines", leave=False):
-            try:
-                if "scorecam" in methods:
-                    res = compute_scorecam(model_fp32, img, layer_fp32, device="cuda", plot=False, return_map=True)
-                    baselines["scorecam"].append(res)
-                if "eigencam" in methods:
-                    res = compute_eigencam(model_fp32, img, layer_fp32, device="cuda", plot=False, return_map=True)
-                    baselines["eigencam"].append(res)
-                if "shap" in methods:
-                    res = compute_shap(model_fp32, img, max_evals=100, device="cuda", plot=False, return_values=True)
-                    baselines["shap"].append(res)
-                if "lime" in methods:
-                    res = compute_lime(model_fp32, img, num_samples=250, device="cuda", plot=False, return_mask=True)
-                    baselines["lime"].append(res)
-            except Exception as e:
-                print(f"   ⚠️ Baseline gen failed: {e}")
-                for m in methods:
-                    if len(baselines[m]) < (len(baselines["scorecam"]) if "scorecam" in methods else 1):
-                        baselines[m].append(None)
-
-        # 5. Define Variants
+        # Variant definitions
         variants = [
-            ("fp16",  f"ft{epochs_ft}_fp16", "cuda"),
-            ("bf16",  f"ft{epochs_ft}_bf16", "cuda"),
-            ("int8",  f"ft{epochs_ft}_qat{epochs_qat}_int8", "cpu"),
-            ("ptqfx", f"ft{epochs_ft}_ptqfx", "cpu")
+            ("fp16", "p16", "cuda"),
+            ("bf16", "bf16", "cuda"),
+            ("int8", "int8", "cpu"),
+            ("ptqfx", "ptqfx", "cpu")
         ]
+        variant_tags = [tag for tag, _, _ in variants]
+        print(f"[INFO] Variants scheduled: {variant_tags}")
 
-        # 6. Iterate Variants & Compare
+        # Pre-load all variant models
+        variant_models = {}
         for tag, suffix, dev in variants:
-            print(f"\n   👉 Comparing Baseline vs {tag.upper()} ({dev})")
-            
+            print(f"[LOAD] Model variant={tag} device={dev}")
             model_var = self.load_model(arch, tag, suffix, dev)
-            if model_var is None: continue
+            if model_var is not None:
+                variant_models[tag] = (model_var, dev)
+            else:
+                print(f" ⚠️ Could not load {tag}, skipping.")
 
-            self.results[arch][tag] = {m: {} for m in methods}
+        # ========== UMAP  ==========
+        if "umap" in methods:
+            print("\n" + "="*60)
+            print("[UMAP] FEATURE EXTRACTION ")
+            print("="*60)
+            print("[UMAP] Extracting baseline feature embeddings")
+            # Baseline features
+            feats_32, labels_32 = get_model_features(model_fp32, val_loader, device="cuda", max_samples=max_samples_umap)
+            emb_32 = compute_umap(feats_32, labels_32)
 
-            # --- UMAP GLOBAL LOGIC DRIFT--
-            try:
-                print(f"      [UMAP] Extracting Variant Features...", end="\r")
-                feats_var, _ = get_model_features(model_var, val_loader, device=dev, max_samples=None)
-                
-
-                feats_var_scaled = scaler.transform(feats_var)
-                emb_var = reducer.transform(feats_var_scaled)
-
-                from maco_package.compare import compare_umap_embeddings
-                self.results[arch][tag]["umap"] = compare_umap_embeddings(emb_32, emb_var, lbls_32)
-                print(f"      [UMAP] Logic Drift: {self.results[arch][tag]['umap']['avg_logic_drift']:.4f}")
-            except Exception as e:
-                print(f"      ⚠️ UMAP Failed for {tag}: {e}")
-
-            # --- PER-IMAGE LOOP (CAM, LIME, SHAP) ---
-            layer_var = layer_fp32
-            if arch == "resnet50" and tag in ["int8", "ptqfx"]: layer_var = "layer4.2.conv3"
-            if arch == "efficientnet_b0" and tag == ["ptqfx"]: layer_var = "features"
-
-            for i, img in enumerate(tqdm(sample_images, desc=f"Processing {tag}", unit="img")):
+            for tag, (model_var, dev) in variant_models.items():
+                print(f"[UMAP] variant={tag} device={dev}")
                 try:
-                    if "scorecam" in methods and baselines["scorecam"][i] is not None:
-                        res = compute_scorecam(model_var, img, layer_var, device=dev, plot=False, return_map=True)
-                        if res is not None:
-                            metrics = compare_heatmaps(baselines["scorecam"][i], res)
-                            for k, v in metrics.items(): self.results[arch][tag]["scorecam"].setdefault(k, []).append(v)
+                    feats_var, labels_var = get_model_features(model_var, val_loader, device=dev, max_samples=max_samples_umap)
+                    emb_var = compute_umap(feats_var, labels_var)
+                    umap_metrics = compare_umap_embeddings(emb_32, emb_var, labels_32)
+                    self.results[arch].setdefault(tag, {})["umap"] = umap_metrics
+                except Exception as e:
+                    print(f" ⚠️ UMAP failed for {tag}: {e}")
+        else:
+            print(" Skipping UMAP (not requested).")
 
-                    if "eigencam" in methods and baselines["eigencam"][i] is not None:
-                        res = compute_eigencam(model_var, img, layer_var, device=dev, plot=False, return_map=True)
-                        if res is not None:
-                            metrics = compare_heatmaps(baselines["eigencam"][i], res)
-                            for k, v in metrics.items(): self.results[arch][tag]["eigencam"].setdefault(k, []).append(v)
+        # ========== Per-image XAI methods ==========
+        per_image_methods = [m for m in methods if m in ["scorecam", "eigencam", "shap", "lime"]]
+        if per_image_methods:
+            print("\n" + "="*60)
+            print(f" PER-IMAGE XAI METHODS: {per_image_methods}")
+            print("="*60)
+            print(f"[XAI] image comparisons started | max_images={num_images} | batch_size={val_loader.batch_size}")
 
-                    if "shap" in methods and baselines["shap"][i] is not None:
-                        res = compute_shap(model_var, img, max_evals=100, device=dev, plot=False, return_values=True)
-                        if res is not None:
-                            metrics = compare_attributions(baselines["shap"][i], res)
-                            for k, v in metrics.items(): self.results[arch][tag]["shap"].setdefault(k, []).append(v)
-                    
-                    if "lime" in methods and baselines["lime"][i] is not None:
-                        res = compute_lime(model_var, img, num_samples=250, device=dev, plot=False, return_mask=True)
-                        if res is not None:
-                            metrics = compare_masks(baselines["lime"][i], res)
-                            for k, v in metrics.items(): self.results[arch][tag]["lime"].setdefault(k, []).append(v)
+            for tag in variant_models.keys():
+                self.results[arch].setdefault(tag, {})
+                for m in per_image_methods:
+                    self.results[arch][tag].setdefault(m, {})
 
-                except Exception:
-                    continue
-            
-            del model_var
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
+            processed = 0
+            pbar = tqdm(
+                total=num_images,
+                desc=f"{arch}",
+                unit="img",
+                dynamic_ncols=True
+            )
 
+            for batch_idx, (images, labels) in enumerate(val_loader):
+                if processed >= num_images:
+                    break
+
+                batch_size = images.size(0)
+                images_cpu = images.cpu()
+
+                for i in range(batch_size):
+                    if processed >= num_images:
+                        break
+
+                    img_tensor = images_cpu[i]
+
+                    # --- Compute baseline explanations ---
+                    baseline_explanations = {}
+                    try:
+                        if "scorecam" in per_image_methods:
+                            res = compute_scorecam(model_fp32, img_tensor, layer_fp32, device="cuda", plot=False, return_map=True)
+                            baseline_explanations["scorecam"] = res
+                        if "eigencam" in per_image_methods:
+                            baseline_explanations["eigencam_cuda"] = compute_eigencam(model_fp32, img_tensor, layer_fp32, device="cuda", plot=False, return_map=True)
+                            baseline_explanations["eigencam_cpu"] = compute_eigencam(model_fp32_cpu, img_tensor, layer_fp32, device="cpu", plot=False, return_map=True)
+                        if "shap" in per_image_methods:
+                            res = compute_shap(model_fp32, img_tensor, max_evals=100, device="cuda", plot=False, return_values=True)
+                            baseline_explanations["shap"] = res
+                        if "lime" in per_image_methods:
+                            res = compute_lime(model_fp32, img_tensor, num_samples=100, device="cuda", plot=False, return_mask=True)
+                            baseline_explanations["lime"] = res
+                    except Exception as e:
+                        print(f" ⚠️ Baseline generation failed for image {processed}: {e}")
+                        processed += 1
+                        pbar.update(1)
+                        continue
+
+                    # --- For each variant, compute and compare ---
+                    for tag, (model_var, dev) in variant_models.items():
+                        layer_var = layer_map.get(arch, {}).get(tag, "features")
+
+                        for method in per_image_methods:
+                            if method == "eigencam":
+                                baseline_map = True  
+                            else:
+                                baseline_map = baseline_explanations.get(method)
+                            pbar.set_postfix({
+                                "variant": tag,
+                                "method": method
+                            })
+
+                            if baseline_map is None:
+                                continue
+                            
+                            try:
+                                if method == "scorecam":
+                                    var_map = compute_scorecam(model_var, img_tensor, layer_var, device=dev, plot=False, return_map=True)
+                                    if var_map is not None:
+                                        metrics = compare_heatmaps(baseline_map, var_map)
+                                elif method == "eigencam":
+                                    ref_key = "eigencam_cpu" if dev == "cpu" else "eigencam_cuda"
+                                    ref_map = baseline_explanations.get(ref_key) 
+                                    var_map = compute_eigencam(model_var, img_tensor, layer_var, device=dev, plot=False, return_map=True)
+                                    if var_map is not None and ref_map is not None:
+                                        metrics = compare_heatmaps(ref_map, var_map)
+                                elif method == "shap":
+                                    var_attr = compute_shap(model_var, img_tensor, max_evals=100, device=dev, plot=False, return_values=True)
+                                    if var_attr is not None:
+                                        metrics = compare_attributions(baseline_map, var_attr)
+                                elif method == "lime":
+                                    var_mask = compute_lime(model_var, img_tensor, num_samples=100, device=dev, plot=False, return_mask=True)
+                                    if var_mask is not None:
+                                        metrics = compare_masks(baseline_map, var_mask)
+                                else:
+                                    continue
+
+                                # Accumulate metrics 
+                                for metric_name, value in metrics.items():
+                                    d = self.results[arch][tag][method].setdefault(metric_name, {"sum": 0.0, "count": 0})
+                                    d["sum"] += value
+                                    d["count"] += 1
+
+                            except Exception:
+                                continue
+
+                    processed += 1
+                    pbar.update(1)
+
+            pbar.close()
+        else:
+            print(" No per-image XAI methods requested, skipping image-wise comparisons.")
+
+        # Clean up models
         del model_fp32
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        for tag, (model_var, dev) in variant_models.items():
+            del model_var
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def generate_report(self, filename="xai_report.txt"):
+        """
+        Generate report exactly in the original format.
+        Computes means from aggregated sums/counts.
+        """
         with open(filename, "w") as f:
             f.write("XAI ROBUSTNESS & LOGIC DRIFT REPORT\n")
             f.write("==================================\n")
@@ -342,39 +411,47 @@ class XAIComparator:
                     # Print UMAP Drift Metrics
                     if "umap" in methods_data:
                         u = methods_data["umap"]
+                        p_dist = u.get('procrustes_disparity', 0)
+                        t_score = u.get('trustworthiness', 0)
+                        c_drift = u.get('centroid_drift', 0)
                         f.write(f"    [LOGIC DRIFT (UMAP)]\n")
-                        f.write(f"      Avg Logic Drift: {u['avg_logic_drift']:.4f}\n")
-                        f.write(f"      Density Ratio:   {u['density_ratio']:.4f}\n\n")
+                        f.write(f"      Procrustes: {p_dist:.4f} | Trustworthiness: {t_score:.4f} | Mean Class Drift: {c_drift:.4f}\n\n")
                     
+                    def get_mean(method_dict, metric, default=0.0):
+                        if metric in method_dict:
+                            agg = method_dict[metric]
+                            if agg["count"] > 0:
+                                return agg["sum"] / agg["count"]
+                        return default
+
                     # Print ScoreCAM / EigenCAM
                     for m_name in ["scorecam", "eigencam"]:
                         if m_name in methods_data and methods_data[m_name]:
-                            metrics = methods_data[m_name]
+                            mdict = methods_data[m_name]
                             f.write(f"    [{m_name.upper()}]\n")
-                            row1 = f"      SSIM: {np.mean(metrics.get('ssim', [0])):.3f} | "
-                            row1 += f"Corr: {np.mean(metrics.get('corr', [0])):.3f} | "
-                            row1 += f"JS: {np.mean(metrics.get('js', [0])):.3f}\n"
-                            row2 = f"      Dice: {np.mean(metrics.get('dice', [0])):.3f} | "
-                            row2 += f"IoU:  {np.mean(metrics.get('iou', [0])):.3f}  | "
-                            row2 += f"EMD: {np.mean(metrics.get('emd', [0])):.3f}\n"
-                            f.write(row1 + row2 + "\n")
+                            ssim_val = get_mean(mdict, "ssim")
+                            corr_val = get_mean(mdict, "corr")
+                            emd_val = get_mean(mdict, "emd")
+                            iou_val = get_mean(mdict, "iou")
+                            row = f"      SSIM: {ssim_val:.3f} | Pearson: {corr_val:.3f} | "
+                            row += f"Wasserstein: {emd_val:.3f} | IoU: {iou_val:.3f}\n"
+                            f.write(row + "\n")
 
                     # Print SHAP
                     if "shap" in methods_data and methods_data["shap"]:
-                        metrics = methods_data["shap"]
+                        mdict = methods_data["shap"]
                         f.write(f"    [SHAP]\n")
-                        row = f"      Spearman: {np.mean(metrics.get('spearman', [0])):.3f} | "
-                        row += f"Sign Agree: {np.mean(metrics.get('sign_agreement', [0])):.3f} | "
-                        row += f"Top-K: {np.mean(metrics.get('topk_overlap', [0])):.3f}\n"
+                        spearman_val = get_mean(mdict, "spearman")
+                        topk_val = get_mean(mdict, "topk_overlap")
+                        row = f"      Spearman: {spearman_val:.3f} | Top-K Overlap: {topk_val:.3f}\n"
                         f.write(row + "\n")
 
                     # Print LIME
                     if "lime" in methods_data and methods_data["lime"]:
-                        metrics = methods_data["lime"]
+                        mdict = methods_data["lime"]
                         f.write(f"    [LIME]\n")
-                        row = f"      IoU: {np.mean(metrics.get('iou', [0])):.3f} | "
-                        row += f"Agreement: {np.mean(metrics.get('agreement', [0])):.3f} | "
-                        row += f"Prec/Rec: {np.mean(metrics.get('precision', [0])):.2f}/{np.mean(metrics.get('recall', [0])):.2f}\n"
+                        iou_val = get_mean(mdict, "iou")
+                        row = f"      IoU: {iou_val:.3f}\n"
                         f.write(row + "\n")
                         
         print(f"✅ Report saved to {filename}")

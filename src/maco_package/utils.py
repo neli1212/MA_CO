@@ -37,42 +37,7 @@ from torchvision.models.quantization import (
 )
 import os
 from torch.ao.quantization import quantize_fx
-
-# =====================================================================
-# Quantizable VGG16 Wrapper
-# =====================================================================
-
-class QuantizableVGG16(nn.Module):
-    """
-    VGG16 model with explicit quant/dequant stubs.
-    """
-    def __init__(self, num_classes):
-        super().__init__()
-
-        self.model = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1)
-        self.model.classifier[6] = nn.Linear(4096, num_classes)
-
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
-
-    def fuse_model(self):
-        """
-        Fuses Conv + ReLU layers for quantization.
-        """
-        for i in range(len(self.model.features) - 1):
-            if isinstance(self.model.features[i], nn.Conv2d) and isinstance(self.model.features[i+1], nn.ReLU):
-                torch.quantization.fuse_modules(
-                    self.model.features,
-                    [str(i), str(i+1)],
-                    inplace=True
-                )
-
-    def forward(self, x):
-        x = self.quant(x)
-        x = self.model(x)
-        x = self.dequant(x)
-        return x
-
+import timm
 
 # =====================================================================
 # Constants
@@ -131,19 +96,10 @@ def PreprocessImagenet(img, return_numpy=False):
     return t.unsqueeze(0)
 
 
-# =====================================================================
-# Class Name Utilities
-# =====================================================================
 
 def load_class_names(root):
     """
-    Loads synset-to-label mapping.
-
-    Args:
-        root (str | Path): Dataset root.
-
-    Returns:
-        dict: Synset to label mapping.
+    Loads label mapping.
     """
     json_path = Path(root) / "Labels.json"
     with open(json_path, "r") as f:
@@ -192,6 +148,7 @@ def safe_fuse(model, is_qat=False):
             model.fuse_model()
 
 
+
 # =====================================================================
 # Base Model Factories
 # =====================================================================
@@ -203,7 +160,9 @@ def get_base_resnet50(num_classes):
 
 
 def get_base_vgg16(num_classes):
-    model = QuantizableVGG16(num_classes)
+    model = models.vgg16(weights="DEFAULT")
+    in_feats = model.classifier[6].in_features
+    model.classifier[6] = nn.Linear(in_feats, num_classes)
     return strip_dropout(model)
 
 
@@ -212,13 +171,15 @@ def get_base_mobilenet(num_classes):
     model.classifier[1] = nn.Linear(model.last_channel, num_classes)
     return strip_dropout(model)
 
+from torchvision.models.quantization import googlenet, GoogLeNet_QuantizedWeights
+from torchvision.models import GoogLeNet_Weights
 
-def get_base_efficientnet(num_classes):
-    model = efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
-    in_feats = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(in_feats, num_classes)
+
+def get_base_googlenet(num_classes):
+    model = googlenet(weights=GoogLeNet_Weights.DEFAULT, quantize=False, transform_input=False)
+    in_feats = model.fc.in_features
+    model.fc = nn.Linear(in_feats, num_classes)
     return strip_dropout(model)
-
 
 def get_base_densenet(num_classes):
     model = densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
@@ -226,13 +187,23 @@ def get_base_densenet(num_classes):
     model.classifier = nn.Linear(in_feats, num_classes)
     return strip_dropout(model)
 
+from torchvision.models import mnasnet1_0, MNASNet1_0_Weights
 
+def get_base_mnasnet(num_classes):
+    model = mnasnet1_0(weights=MNASNet1_0_Weights.IMAGENET1K_V1)
+    # Letzte Schicht heißt 'classifier' (ein Linear)
+    in_feats = model.classifier[1].in_features
+    model.classifier[1] = nn.Linear(in_feats, num_classes)
+    return strip_dropout(model)
+
+    
 BASE_FACTORIES = {
-    "resnet50":        get_base_resnet50,
-    "vgg16":           get_base_vgg16,
-    "mobilenet_v2":    get_base_mobilenet,
-    "efficientnet_b0": get_base_efficientnet,
-    "densenet121":     get_base_densenet,
+    "resnet50": get_base_resnet50,
+    "vgg16": get_base_vgg16,
+    "mobilenet_v2": get_base_mobilenet,
+    "densenet121": get_base_densenet,
+    "googlenet": get_base_googlenet,
+    "mnasnet": get_base_mnasnet       
 }
 
 
@@ -240,56 +211,57 @@ BASE_FACTORIES = {
 # Quantization Conversions
 # =====================================================================
 
+from torch.ao.quantization import get_default_qat_qconfig_mapping
+from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx, prepare_fx
+
 def to_fp16(model):
-    """Converts model to FP16."""
+    """Converts model to FP16"""
     return model.half()
 
-
 def to_bf16(model):
-    """Converts model to BF16."""
+    """Converts model to BF16"""
     return model.to(torch.bfloat16)
 
-
 def to_qatfake(model, backend="fbgemm"):
-    """Prepares model for fake-QAT."""
-    model.eval()
-    safe_fuse(model, is_qat=True)
-    torch.backends.quantized.engine = backend
-    model.qconfig = get_default_qat_qconfig(backend)
+    """Converts model to fake-QAT"""
     model.train()
-    prepare_qat(model, inplace=True)
-    return model
+    device = next(model.parameters()).device
+    example_input = torch.randn(1, 3, 224, 224).to(device)
 
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend)
+    prepared = prepare_qat_fx(model, qconfig_mapping, example_input)
+    
+    return prepared
 
 def to_int8(model, backend="fbgemm"):
-    """Converts QAT-prepared model to INT8."""
-    torch.backends.quantized.engine = backend
-    model.eval()
-    safe_fuse(model, is_qat=True)
-
+    """Converts model to QAT"""
     model.train()
-    model.qconfig = get_default_qat_qconfig(backend)
-    prepare_qat(model, inplace=True)
-
-    model.cpu().eval()
-    return convert(model, inplace=False)
-
+    
+    device = next(model.parameters()).device
+    example_input = torch.randn(1, 3, 224, 224).to(device)
+    qconfig_mapping = get_default_qat_qconfig_mapping(backend)
+    prepared = prepare_qat_fx(model, qconfig_mapping, example_input)
+    prepared.eval()
+    converted = convert_fx(prepared)
+    
+    return converted
 
 def to_ptqfx(model, backend="fbgemm", calibrate=False):
-    """Applies FX-based PTQ."""
+    """Converts model to PTQ"""
     model.eval()
     torch.backends.quantized.engine = backend
+    
+    device = next(model.parameters()).device
+    example_input = torch.randn(1, 3, 224, 224).to(device)
 
     qconfig_mapping = torch.ao.quantization.get_default_qconfig_mapping(backend)
-    example_input = torch.randn(1, 3, 224, 224)
-
-    prepared = quantize_fx.prepare_fx(model, qconfig_mapping, example_input)
+    prepared = prepare_fx(model, qconfig_mapping, example_input)
 
     if calibrate:
         with torch.no_grad():
             prepared(example_input)
 
-    return quantize_fx.convert_fx(prepared).eval()
+    return convert_fx(prepared).eval()
 
 
 # =====================================================================

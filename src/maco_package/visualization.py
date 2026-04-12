@@ -43,9 +43,6 @@ def show_image(img, denorm=False):
     if isinstance(img, Image.Image):
         arr = np.array(img)
 
-    # ------------------------------------------------------
-    # Tensor input
-    # ------------------------------------------------------
     elif isinstance(img, torch.Tensor):
         t = img.detach().cpu()
 
@@ -92,15 +89,9 @@ def ShowTop5(model, img, class_names):
         - Always runs inference on CPU
     """
 
-    # ------------------------------------------------------
-    # Always run on CPU for simplicity
-    # ------------------------------------------------------
     device = torch.device("cpu")
     net = model.to(device).eval()
 
-    # ------------------------------------------------------
-    # Preprocess input
-    # ------------------------------------------------------
     if isinstance(img, torch.Tensor):
         if img.ndim == 3:
             x = img.unsqueeze(0).to(device)  # CHW
@@ -123,25 +114,13 @@ def ShowTop5(model, img, class_names):
 
         x = tf(img).unsqueeze(0).to(device)
 
-    # ------------------------------------------------------
-    # Forward pass
-    # ------------------------------------------------------
     with torch.no_grad():
         probs = net(x).softmax(1).cpu().numpy()[0]
 
-    # ------------------------------------------------------
-    # Top-5 indices
-    # ------------------------------------------------------
-    top5 = np.argsort(probs)[-5:][::-1]
 
-    # ------------------------------------------------------
-    # Display image
-    # ------------------------------------------------------
+    top5 = np.argsort(probs)[-5:][::-1]
     show_image(img, denorm=False)
 
-    # ------------------------------------------------------
-    # Print predictions
-    # ------------------------------------------------------
     print("\nTop-5 predictions:")
     for i in top5:
         print(f"{class_names[i]}: {probs[i] * 100:.2f}%")
@@ -173,10 +152,6 @@ def show_random_sample(dataset, class_to_idx, synset_to_name, return_sample=Fals
     name = synset_to_name.get(synset, synset)
 
     print("Label:", name)
-
-    # ------------------------------------------------------
-    # Denormalize
-    # ------------------------------------------------------
     unnorm = (
         img_tensor.clone()
         * torch.tensor(IMAGENET_STD)[:, None, None]
@@ -185,9 +160,6 @@ def show_random_sample(dataset, class_to_idx, synset_to_name, return_sample=Fals
 
     pil_img = to_pil_image(unnorm)
 
-    # ------------------------------------------------------
-    # Show
-    # ------------------------------------------------------
     show_image(unnorm, denorm=False)
 
     if return_sample:
