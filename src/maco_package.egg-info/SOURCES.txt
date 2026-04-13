@@ -1,6 +1,14 @@
+README.md
 pyproject.toml
 src/maco_package/__init__.py
-src/maco_package/plot.py
+src/maco_package/compare.py
+src/maco_package/compare_pipeline.py
+src/maco_package/data.py
+src/maco_package/quantization.py
+src/maco_package/quantize_pipeline.py
+src/maco_package/utils.py
+src/maco_package/visualization.py
+src/maco_package/xai.py
 src/maco_package.egg-info/PKG-INFO
 src/maco_package.egg-info/SOURCES.txt
 src/maco_package.egg-info/dependency_links.txt
