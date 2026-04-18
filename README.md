@@ -1,5 +1,8 @@
-# code für masterarbeit
-
+# Code der Masterarbeit
+Dieses repo ist der Code für die Masterarbeit "Bewertung der Robustheit von
+CNN-Architekturen gegenüber
+Modellquantisierung mittels Methoden der
+erklarbaren KI" von Cornelius Rottmair
 
 ## Git LSF
 Die in dieser Arbeit trainierten und untersuchten Modelle sind aufgrund ihrer Dateigröße über Git LFS ausgelagert. Falls die Modelle nicht selbst trainiert, sondern lediglich geladen werden sollen, kann dies nach dem Klonen des Repositories über die folgenden Befehle erfolgen:
@@ -92,7 +95,7 @@ Der Parameter `--img_count` legt fest, wie viele Bilder aus dem Validierungsdate
 
 Der Parameter `--batch_size` steuert die Batchgröße während der Verarbeitung der Bilder.
 
-Der Parameter `--umap_samples` legt fest, wie viele Samples für die UMAP-basierte Analyse verwendet werden (nur relevant, falls UMAP als Methode aktiviert ist).
+Der Parameter `--umap_samples` legt fest, wie viele Samples für die UMAP-basierte Analyse verwendet werden (wenn wegelassen wird er geamte Datensaz benutzt).
 
 Der Parameter `--save_dir` bestimmt das Verzeichnis, in dem die Modellartefakte und Ergebnisse gespeichert werden.
 
