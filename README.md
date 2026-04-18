@@ -48,7 +48,7 @@ Die vier erzeugten Modellvarianten sind: Post-Training-Quantisierung (PTQ), Quan
 Die Pipeline kann beispielsweise ausgeführt werden mit:
 
 ```bash
-python quantize_pipeline.py \
+python src/maco_package/quantize_pipeline.py \
   --model_type resnet50 \
   --root data/imagenet100/versions/8 \
   --epochs_ft 10 \
@@ -77,7 +77,7 @@ Hierzu werden verschiedene XAI-Methoden auf eine definierte Anzahl von Validieru
 Ein typischer Aufruf dieser Pipeline ist:
 
 ```bash
-python compare_pipeline.py \
+python src/maco_package/compare_pipeline.py \
   --model_type resnet50 \
   --root data/imagenet100/versions/8 \
   --img_count 1000 \
